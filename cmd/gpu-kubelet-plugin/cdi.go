@@ -31,6 +31,8 @@ import (
 	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
 	cdiparser "tags.cncf.io/container-device-interface/pkg/parser"
 	cdispec "tags.cncf.io/container-device-interface/specs-go"
+
+	configapi "github.com/NVIDIA/k8s-dra-driver-gpu/api/nvidia.com/resource/v1beta1"
 )
 
 const (
@@ -223,6 +225,14 @@ func (cdi *CDIHandler) CreateClaimSpecFile(claimUID string, preparedDevices Prep
 				ContainerEdits: *group.ConfigState.containerEdits.ContainerEdits,
 			}
 
+			// Add fabric topology information if available
+			if group.ConfigState.FabricAllocation != nil {
+				cdi.addFabricAllocationToDeviceSpec(&deviceSpec, group.ConfigState.FabricAllocation)
+			} else if group.ConfigState.FabricPartitionID != "" {
+				// Fallback to old approach for backward compatibility
+				cdi.addFabricTopologyToDeviceSpec(&deviceSpec, group.ConfigState.FabricPartitionID)
+			}
+
 			deviceSpecs = append(deviceSpecs, deviceSpec)
 		}
 	}
@@ -278,4 +288,87 @@ func (cdi *CDIHandler) GetClaimDevice(claimUID string, device *AllocatableDevice
 		return ""
 	}
 	return cdiparser.QualifiedName(cdiVendor, cdiClaimClass, fmt.Sprintf("%s-%s", claimUID, device.CanonicalName()))
+}
+
+// addFabricAllocationToDeviceSpec adds fabric allocation information to a CDI device specification.
+func (cdi *CDIHandler) addFabricAllocationToDeviceSpec(deviceSpec *cdispec.Device, fabricAllocation *configapi.FabricResourceAllocation) {
+	if fabricAllocation == nil {
+		return
+	}
+
+	// Get the appropriate handler for the virtualization model
+	handler := GetFabricHandler(fabricAllocation.VirtualizationModel)
+
+	// Generate CDI spec using the handler
+	fabricDeviceSpec := handler.GenerateCDISpec(fabricAllocation)
+	if fabricDeviceSpec != nil {
+		// Merge the fabric device spec into the main device spec
+		deviceSpec.ContainerEdits.Env = append(deviceSpec.ContainerEdits.Env, fabricDeviceSpec.ContainerEdits.Env...)
+		deviceSpec.ContainerEdits.Hooks = append(deviceSpec.ContainerEdits.Hooks, fabricDeviceSpec.ContainerEdits.Hooks...)
+		deviceSpec.ContainerEdits.Mounts = append(deviceSpec.ContainerEdits.Mounts, fabricDeviceSpec.ContainerEdits.Mounts...)
+	}
+}
+
+// addFabricTopologyToDeviceSpec adds fabric topology information to a CDI device specification.
+func (cdi *CDIHandler) addFabricTopologyToDeviceSpec(deviceSpec *cdispec.Device, fabricPartitionID string) {
+	// Add fabric topology environment variables
+	fabricEnvVars := cdi.generateFabricTopologyEnvironmentVariables(fabricPartitionID)
+	deviceSpec.ContainerEdits.Env = append(deviceSpec.ContainerEdits.Env, fabricEnvVars...)
+
+	// Add fabric topology hooks
+	fabricHooks := cdi.generateFabricTopologyHooks(fabricPartitionID)
+	deviceSpec.ContainerEdits.Hooks = append(deviceSpec.ContainerEdits.Hooks, fabricHooks...)
+
+	// Add fabric topology mounts
+	fabricMounts := cdi.generateFabricTopologyMounts(fabricPartitionID)
+	deviceSpec.ContainerEdits.Mounts = append(deviceSpec.ContainerEdits.Mounts, fabricMounts...)
+}
+
+// generateFabricTopologyEnvironmentVariables generates environment variables for fabric topology.
+func (cdi *CDIHandler) generateFabricTopologyEnvironmentVariables(fabricPartitionID string) []string {
+	return []string{
+		fmt.Sprintf("NVIDIA_FABRIC_PARTITION_ID=%s", fabricPartitionID),
+		"NVIDIA_FABRIC_TOPOLOGY_ENABLED=true",
+		"NVIDIA_NVLINK_OPTIMIZATION=true",
+		fmt.Sprintf("CUDA_VISIBLE_DEVICES_FABRIC_PARTITION=%s", fabricPartitionID),
+	}
+}
+
+// generateFabricTopologyHooks generates CDI hooks for fabric topology.
+func (cdi *CDIHandler) generateFabricTopologyHooks(fabricPartitionID string) []*cdispec.Hook {
+	return []*cdispec.Hook{
+		{
+			HookName: "nvidia-fabric-topology-hook",
+			Path:     cdi.nvidiaCDIHookPath,
+			Args: []string{
+				"--fabric-partition-id=" + fabricPartitionID,
+				"--enable-nvlink-optimization",
+			},
+			Env: []string{
+				"NVIDIA_FABRIC_PARTITION_ID=" + fabricPartitionID,
+				"NVIDIA_FABRIC_TOPOLOGY_ENABLED=true",
+			},
+		},
+	}
+}
+
+// generateFabricTopologyMounts generates CDI mounts for fabric topology.
+func (cdi *CDIHandler) generateFabricTopologyMounts(fabricPartitionID string) []*cdispec.Mount {
+	return []*cdispec.Mount{
+		{
+			HostPath:      "/sys/class/nvlink",
+			ContainerPath: "/sys/class/nvlink",
+			Options:       []string{"ro"},
+		},
+		{
+			HostPath:      "/proc/driver/nvidia/gpus",
+			ContainerPath: "/proc/driver/nvidia/gpus",
+			Options:       []string{"ro"},
+		},
+		{
+			HostPath:      "/var/run/nvidia-fabric",
+			ContainerPath: "/var/run/nvidia-fabric",
+			Options:       []string{"rw"},
+		},
+	}
 }

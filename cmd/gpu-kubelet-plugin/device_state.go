@@ -41,6 +41,8 @@ type OpaqueDeviceConfig struct {
 type DeviceConfigState struct {
 	MpsControlDaemonID string `json:"mpsControlDaemonID"`
 	containerEdits     *cdiapi.ContainerEdits
+	FabricPartitionID  string                              `json:"fabricPartitionID,omitempty"`
+	FabricAllocation   *configapi.FabricResourceAllocation `json:"fabricAllocation,omitempty"`
 }
 
 type DeviceState struct {
@@ -48,6 +50,7 @@ type DeviceState struct {
 	cdi         *CDIHandler
 	tsManager   *TimeSlicingManager
 	mpsManager  *MpsManager
+	fmManager   *FabricManagerManager
 	allocatable AllocatableDevices
 	config      *Config
 
@@ -95,6 +98,14 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 		mpsManager = NewMpsManager(config, nvdevlib, hostDriverRoot, MpsControlDaemonTemplatePath)
 	}
 
+	var fmManager *FabricManagerManager
+	if featuregates.Enabled(featuregates.FabricTopologySupport) {
+		fmManager, err = NewFabricManagerManager(ctx, config)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create FabricManager manager: %w", err)
+		}
+	}
+
 	if err := cdi.CreateStandardDeviceSpecFile(allocatable); err != nil {
 		return nil, fmt.Errorf("unable to create base CDI spec file: %v", err)
 	}
@@ -108,6 +119,7 @@ func NewDeviceState(ctx context.Context, config *Config) (*DeviceState, error) {
 		cdi:               cdi,
 		tsManager:         tsManager,
 		mpsManager:        mpsManager,
+		fmManager:         fmManager,
 		allocatable:       allocatable,
 		config:            config,
 		nvdevlib:          nvdevlib,
@@ -412,6 +424,28 @@ func (s *DeviceState) unprepareDevices(ctx context.Context, claimUID string, dev
 			}
 		}
 
+		// Deactivate fabric partitions if they were activated
+		if featuregates.Enabled(featuregates.FabricTopologySupport) && s.fmManager != nil {
+			if group.ConfigState.FabricAllocation != nil && group.ConfigState.FabricAllocation.AllocatedPartition != nil {
+				// Use new fabric allocation approach
+				partitionID := group.ConfigState.FabricAllocation.AllocatedPartition.ID
+				if err := s.fmManager.DeactivatePartition(ctx, partitionID); err != nil {
+					klog.Warningf("Failed to deactivate fabric partition %s: %v", partitionID, err)
+					// Don't fail the unprepare operation if fabric partition deactivation fails
+				} else {
+					klog.V(4).Infof("Deactivated fabric partition %s for claim %s", partitionID, claimUID)
+				}
+			} else if group.ConfigState.FabricPartitionID != "" {
+				// Fallback to old approach for backward compatibility
+				if err := s.fmManager.DeactivatePartition(ctx, group.ConfigState.FabricPartitionID); err != nil {
+					klog.Warningf("Failed to deactivate fabric partition %s: %v", group.ConfigState.FabricPartitionID, err)
+					// Don't fail the unprepare operation if fabric partition deactivation fails
+				} else {
+					klog.V(4).Infof("Deactivated fabric partition %s for claim %s", group.ConfigState.FabricPartitionID, claimUID)
+				}
+			}
+		}
+
 		// Go back to default time-slicing for all full GPUs.
 		if featuregates.Enabled(featuregates.TimeSlicingSettings) {
 			tsc := configapi.DefaultGpuConfig().Sharing.TimeSlicingConfig
@@ -426,7 +460,7 @@ func (s *DeviceState) unprepareDevices(ctx context.Context, claimUID string, dev
 func (s *DeviceState) applyConfig(ctx context.Context, config configapi.Interface, claim *resourceapi.ResourceClaim, results []*resourceapi.DeviceRequestAllocationResult) (*DeviceConfigState, error) {
 	switch castConfig := config.(type) {
 	case *configapi.GpuConfig:
-		return s.applySharingConfig(ctx, castConfig.Sharing, claim, results)
+		return s.applyGpuConfig(ctx, castConfig, claim, results)
 	case *configapi.MigDeviceConfig:
 		return s.applySharingConfig(ctx, castConfig.Sharing, claim, results)
 	default:
@@ -482,6 +516,76 @@ func (s *DeviceState) applySharingConfig(ctx context.Context, config configapi.S
 	}
 
 	return &configState, nil
+}
+
+// applyGpuConfig applies GPU configuration including sharing and fabric topology settings.
+func (s *DeviceState) applyGpuConfig(ctx context.Context, config *configapi.GpuConfig, claim *resourceapi.ResourceClaim, results []*resourceapi.DeviceRequestAllocationResult) (*DeviceConfigState, error) {
+	// First apply sharing configuration
+	configState, err := s.applySharingConfig(ctx, config.Sharing, claim, results)
+	if err != nil {
+		return nil, fmt.Errorf("error applying sharing config: %w", err)
+	}
+
+	// Then apply fabric topology configuration if enabled
+	if featuregates.Enabled(featuregates.FabricTopologySupport) && config.FabricTopologyConfig != nil {
+		if err := s.applyFabricTopologyConfig(ctx, config.FabricTopologyConfig, claim, results, configState); err != nil {
+			return nil, fmt.Errorf("error applying fabric topology config: %w", err)
+		}
+	}
+
+	return configState, nil
+}
+
+// applyFabricTopologyConfig applies fabric topology configuration.
+func (s *DeviceState) applyFabricTopologyConfig(ctx context.Context, config *configapi.FabricTopologyConfig, claim *resourceapi.ResourceClaim, results []*resourceapi.DeviceRequestAllocationResult, configState *DeviceConfigState) error {
+	if s.fmManager == nil {
+		return fmt.Errorf("FabricManager manager not initialized")
+	}
+
+	// Get the list of GPU UUIDs for this allocation
+	var gpuUUIDs []string
+	for _, result := range results {
+		device, exists := s.allocatable[result.Device]
+		if !exists {
+			return fmt.Errorf("requested device is not allocatable: %v", result.Device)
+		}
+		if device.Type() == GpuDeviceType {
+			gpuUUIDs = append(gpuUUIDs, device.Gpu.UUID)
+		}
+	}
+
+	if len(gpuUUIDs) == 0 {
+		klog.V(4).Info("No GPU devices found for fabric topology configuration")
+		return nil
+	}
+
+	// Determine virtualization model
+	virtualizationModel := configapi.FabricVirtualizationBareMetal // Default
+	if config.VirtualizationModel != nil {
+		virtualizationModel = *config.VirtualizationModel
+	}
+
+	// Get the appropriate handler for the virtualization model
+	handler := GetFabricHandler(virtualizationModel)
+
+	// Allocate fabric resources using the handler
+	fabricAllocation, err := handler.AllocateFabricResources(ctx, gpuUUIDs, config, s.fmManager)
+	if err != nil {
+		return fmt.Errorf("failed to allocate fabric resources: %w", err)
+	}
+
+	// Store fabric allocation information in config state
+	configState.FabricAllocation = fabricAllocation
+
+	// Store partition ID for backward compatibility
+	if fabricAllocation.AllocatedPartition != nil {
+		configState.FabricPartitionID = fabricAllocation.AllocatedPartition.ID
+	}
+
+	klog.V(4).Infof("Allocated fabric resources for claim %s with virtualization model %s",
+		claim.UID, virtualizationModel)
+
+	return nil
 }
 
 // GetOpaqueDeviceConfigs returns an ordered list of the configs contained in possibleConfigs for this driver.

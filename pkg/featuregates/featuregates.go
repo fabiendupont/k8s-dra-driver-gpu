@@ -33,6 +33,9 @@ const (
 
 	// MPSSupport allows MPS (Multi-Process Service) settings to be specified.
 	MPSSupport featuregate.Feature = "MPSSupport"
+
+	// FabricTopologySupport allows fabric topology configuration for GPU interconnects.
+	FabricTopologySupport featuregate.Feature = "FabricTopologySupport"
 )
 
 // FeatureGates is a singleton representing the set of all feature gates and their values.
@@ -56,6 +59,13 @@ var defaultFeatureGates = map[featuregate.Feature]featuregate.VersionedSpecs{
 			Version:    version.MajorMinor(25, 8),
 		},
 	},
+	FabricTopologySupport: {
+		{
+			Default:    false,
+			PreRelease: featuregate.Alpha,
+			Version:    version.MajorMinor(25, 8),
+		},
+	},
 }
 
 // init instantiates and sets the singleton 'FeatureGates' variable with newFeatureGates().
@@ -66,7 +76,19 @@ func init() {
 // parseProjectVersion parses the project version string and returns major.minor version.
 func parseProjectVersion() *version.Version {
 	versionStr := info.GetVersionParts()[0]
-	v := version.MustParse(strings.TrimPrefix(versionStr, "v"))
+
+	// Handle "unknown" version case for development/testing
+	if versionStr == "unknown" {
+		return version.MajorMinor(25, 8)
+	}
+
+	// Remove "v" prefix if present
+	versionStr = strings.TrimPrefix(versionStr, "v")
+
+	// Handle version strings with "-dev" suffix
+	versionStr = strings.Split(versionStr, "-")[0]
+
+	v := version.MustParse(versionStr)
 	return version.MajorMinor(v.Major(), v.Minor())
 }
 

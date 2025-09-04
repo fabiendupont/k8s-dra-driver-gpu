@@ -1,0 +1,130 @@
+/*
+ * Copyright (c) 2024, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+syntax = "proto3";
+
+package fabricmanager;
+
+option go_package = "github.com/NVIDIA/k8s-dra-driver-gpu/internal/fabricmanager";
+
+// FabricManager service for managing GPU fabric topology
+service FabricManager {
+    // GetTopology retrieves the current fabric topology
+    rpc GetTopology(GetTopologyRequest) returns (GetTopologyResponse);
+    
+    // ActivatePartition activates a fabric partition
+    rpc ActivatePartition(ActivatePartitionRequest) returns (ActivatePartitionResponse);
+    
+    // DeactivatePartition deactivates a fabric partition
+    rpc DeactivatePartition(DeactivatePartitionRequest) returns (DeactivatePartitionResponse);
+    
+    // GetPartitionStatus retrieves the status of a fabric partition
+    rpc GetPartitionStatus(GetPartitionStatusRequest) returns (GetPartitionStatusResponse);
+}
+
+// GetTopologyRequest is empty as we want the complete topology
+message GetTopologyRequest {
+}
+
+// GetTopologyResponse contains the fabric topology information
+message GetTopologyResponse {
+    repeated FabricPartition partitions = 1;
+    repeated Interconnect interconnects = 2;
+    map<string, double> bandwidth = 3;  // GB/s
+    map<string, double> latency = 4;    // ms
+    int64 timestamp = 5;                // Unix timestamp
+    string source = 6;
+}
+
+// ActivatePartitionRequest contains the partition ID to activate
+message ActivatePartitionRequest {
+    string partition_id = 1;
+}
+
+// ActivatePartitionResponse contains the result of partition activation
+message ActivatePartitionResponse {
+    bool success = 1;
+    string message = 2;
+    string error = 3;
+}
+
+// DeactivatePartitionRequest contains the partition ID to deactivate
+message DeactivatePartitionRequest {
+    string partition_id = 1;
+}
+
+// DeactivatePartitionResponse contains the result of partition deactivation
+message DeactivatePartitionResponse {
+    bool success = 1;
+    string message = 2;
+    string error = 3;
+}
+
+// GetPartitionStatusRequest contains the partition ID to query
+message GetPartitionStatusRequest {
+    string partition_id = 1;
+}
+
+// GetPartitionStatusResponse contains the partition status
+message GetPartitionStatusResponse {
+    string partition_id = 1;
+    string state = 2;                    // "active", "inactive", "error"
+    repeated string active_gpus = 3;     // Currently active GPU UUIDs
+    string error = 4;
+    int64 last_updated = 5;              // Unix timestamp
+}
+
+// FabricPartition represents a logical partition of GPUs
+message FabricPartition {
+    string id = 1;
+    string name = 2;
+    repeated string gpus = 3;            // GPU UUIDs in this partition
+    repeated string nvswitches = 4;      // NVSwitch IDs
+    NVLinkTopology topology = 5;
+    PartitionStatus status = 6;
+    int64 created_at = 7;                // Unix timestamp
+    int64 updated_at = 8;                // Unix timestamp
+}
+
+// NVLinkTopology represents the NVLink connectivity
+message NVLinkTopology {
+    repeated string connected_gpus = 1;
+    map<string, double> bandwidth = 2;   // GB/s between GPU pairs
+    map<string, double> latency = 3;     // ms between GPU pairs
+    string nvlink_version = 4;
+    double max_bandwidth = 5;            // GB/s
+    double min_latency = 6;              // ms
+}
+
+// Interconnect represents the interconnect configuration
+message Interconnect {
+    string id = 1;
+    string type = 2;                     // "NVLink", "PCIe", etc.
+    repeated string connected_to = 3;    // Connected device IDs
+    double bandwidth = 4;                // GB/s
+    double latency = 5;                  // ms
+    string status = 6;                   // "active", "inactive", "error"
+}
+
+// PartitionStatus represents the status of a fabric partition
+message PartitionStatus {
+    string id = 1;
+    string state = 2;                    // "active", "inactive", "error"
+    repeated string active_gpus = 3;     // Currently active GPU UUIDs
+    string error = 4;
+    int64 last_updated = 5;              // Unix timestamp
+}
+

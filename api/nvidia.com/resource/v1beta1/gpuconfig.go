@@ -17,6 +17,8 @@
 package v1beta1
 
 import (
+	"fmt"
+
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/ptr"
 
@@ -27,8 +29,9 @@ import (
 
 // GpuConfig holds the set of parameters for configuring a GPU.
 type GpuConfig struct {
-	metav1.TypeMeta `json:",inline"`
-	Sharing         *GpuSharing `json:"sharing,omitempty"`
+	metav1.TypeMeta      `json:",inline"`
+	Sharing              *GpuSharing           `json:"sharing,omitempty"`
+	FabricTopologyConfig *FabricTopologyConfig `json:"fabricTopologyConfig,omitempty"`
 }
 
 // DefaultGpuConfig provides the default GPU configuration.
@@ -47,6 +50,10 @@ func DefaultGpuConfig() *GpuConfig {
 				Interval: ptr.To(DefaultTimeSlice),
 			},
 		}
+	}
+
+	if featuregates.Enabled(featuregates.FabricTopologySupport) {
+		config.FabricTopologyConfig = DefaultFabricTopologyConfig()
 	}
 
 	return config
@@ -77,13 +84,65 @@ func (c *GpuConfig) Normalize() error {
 		}
 	}
 
+	if featuregates.Enabled(featuregates.FabricTopologySupport) {
+		if c.FabricTopologyConfig == nil {
+			c.FabricTopologyConfig = DefaultFabricTopologyConfig()
+		}
+	}
+
 	return nil
 }
 
 // Validate ensures that GpuConfig has a valid set of values.
 func (c *GpuConfig) Validate() error {
-	if c.Sharing == nil {
+	if c.Sharing != nil {
+		if err := c.Sharing.Validate(); err != nil {
+			return err
+		}
+	}
+
+	if c.FabricTopologyConfig != nil {
+		if err := c.FabricTopologyConfig.Validate(); err != nil {
+			return err
+		}
+	}
+
+	// Validate compatibility between sharing strategy and fabric topology
+	if c.Sharing != nil && c.FabricTopologyConfig != nil {
+		if err := c.validateSharingFabricCompatibility(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// validateSharingFabricCompatibility validates that the sharing strategy is compatible with fabric topology.
+func (c *GpuConfig) validateSharingFabricCompatibility() error {
+	// Check if both configs are present
+	if c.Sharing == nil || c.FabricTopologyConfig == nil {
 		return nil
 	}
-	return c.Sharing.Validate()
+
+	// Only validate if fabric topology is not disabled
+	if c.FabricTopologyConfig.Strategy == FabricTopologyDisabled {
+		return nil
+	}
+
+	switch c.Sharing.Strategy {
+	case MpsStrategy:
+		// MPS is not compatible with fabric topology optimization
+		// MPS creates a single control daemon that manages all processes,
+		// which conflicts with fabric partition management
+		return fmt.Errorf("MPS sharing strategy is not compatible with fabric topology optimization. Consider using TimeSlicing or disabling fabric topology")
+
+	case TimeSlicingStrategy:
+		// TimeSlicing is compatible with fabric topology
+		// TimeSlicing works at the CUDA context level and doesn't interfere with fabric partitions
+		return nil
+
+	default:
+		// Unknown sharing strategy - be conservative and reject
+		return fmt.Errorf("unknown sharing strategy %s is not validated for fabric topology compatibility", c.Sharing.Strategy)
+	}
 }

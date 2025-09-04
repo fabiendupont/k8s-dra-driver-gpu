@@ -40,6 +40,70 @@ Hence, the GPU kubelet plugin is currently disabled by default in the Helm chart
 
 For exploration and demonstration purposes, see the "demo" section below, and also browse the `demo/specs/quickstart` directory in this repository.
 
+## 🔗 FabricManager Integration
+
+### High-Bandwidth GPU Communication
+
+The driver now supports **FabricManager integration** for optimal GPU-to-GPU communication through NVLink topology awareness. This enables high-bandwidth communication between GPUs instead of slower PCIe connections.
+
+### Key Features
+
+- **Virtualization Model-Aware**: Different allocation strategies for BareMetal, FullPassthrough, SharedNVSwitch, and vGPU
+- **Resource Allocation Focus**: Allocates fabric resources rather than direct partition management
+- **High-Bandwidth Communication**: Ensures GPUs communicate via NVLink with optimal topology
+- **Backward Compatibility**: Maintains existing functionality with `FabricPartitionID` field
+
+### Example Usage
+
+```yaml
+apiVersion: resource.k8s.io/v1alpha2
+kind: ResourceClaim
+metadata:
+  name: gpu-claim-with-fabric
+spec:
+  resourceClassName: nvidia.com/gpu
+  parameters:
+    apiVersion: nvidia.com/v1beta1
+    kind: GpuConfig
+    sharing:
+      strategy: TimeSlicing
+    fabricTopologyConfig:
+      strategy: Auto                    # Auto, Manual, or Disabled
+      partitionSize: 4                  # 2, 4, or 8 GPUs
+      virtualizationModel: BareMetal    # BareMetal, FullPassthrough, SharedNVSwitch, VGPU
+      minBandwidth: 600.0              # GB/s
+      maxLatency: 0.1                  # ms
+      partitionIDs: ["partition-1"]    # For Manual strategy
+```
+
+### Virtualization Model Support
+
+**BareMetal**:
+- Direct partition management with full control
+- GPUs allocated from optimal fabric partition
+- High-bandwidth NVLink connectivity
+
+**FullPassthrough**:
+- Fabric resources allocated for guest VM management
+- Guest VM handles its own partition management
+- Optimal resource allocation within boundaries
+
+**SharedNVSwitch**:
+- DRA driver acts as service VM
+- Manages partitions on behalf of guests
+- Shared NVSwitch resources allocated
+
+**vGPU**:
+- Fabric topology optimization disabled
+- Standard GPU allocation without fabric constraints
+
+### Feature Gate
+
+The FabricManager integration is controlled by the `FabricTopologySupport` feature gate:
+- **Alpha**: Default disabled
+- **Enable**: Set `FABRIC_TOPOLOGY_SUPPORT=true` in environment
+- **Gradual Rollout**: Can be enabled per node or cluster-wide
+
 ## Installation
 
 As of today, the recommended installation method is via Helm.
