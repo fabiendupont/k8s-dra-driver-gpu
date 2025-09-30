@@ -36,6 +36,7 @@ const (
 
 	// IMEXDaemonsWithDNSNames allows using DNS names instead of raw IPs for IMEX daemons.
 	IMEXDaemonsWithDNSNames featuregate.Feature = "IMEXDaemonsWithDNSNames"
+
 	// FabricManagerSupport allows FabricManager settings and fabric partition management.
 	FabricManagerSupport featuregate.Feature = "FabricManagerSupport"
 )
