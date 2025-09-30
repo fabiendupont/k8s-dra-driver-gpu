@@ -36,6 +36,8 @@ const (
 
 	// IMEXDaemonsWithDNSNames allows using DNS names instead of raw IPs for IMEX daemons.
 	IMEXDaemonsWithDNSNames featuregate.Feature = "IMEXDaemonsWithDNSNames"
+	// FabricManagerSupport allows FabricManager settings and fabric partition management.
+	FabricManagerSupport featuregate.Feature = "FabricManagerSupport"
 )
 
 // FeatureGates is a singleton representing the set of all feature gates and their values.
@@ -63,6 +65,10 @@ var defaultFeatureGates = map[featuregate.Feature]featuregate.VersionedSpecs{
 		{
 			Default:    true,
 			PreRelease: featuregate.Beta,
+	FabricManagerSupport: {
+		{
+			Default:    false,
+			PreRelease: featuregate.Alpha,
 			Version:    version.MajorMinor(25, 8),
 		},
 	},

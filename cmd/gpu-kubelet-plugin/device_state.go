@@ -29,6 +29,7 @@ import (
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/kubelet/checkpointmanager"
 	cdiapi "tags.cncf.io/container-device-interface/pkg/cdi"
+	cdispec "tags.cncf.io/container-device-interface/specs-go"
 
 	configapi "github.com/NVIDIA/k8s-dra-driver-gpu/api/nvidia.com/resource/v1beta1"
 	"github.com/NVIDIA/k8s-dra-driver-gpu/pkg/featuregates"
@@ -40,9 +41,10 @@ type OpaqueDeviceConfig struct {
 }
 
 type DeviceConfigState struct {
-	MpsControlDaemonID string `json:"mpsControlDaemonID"`
-	containerEdits     *cdiapi.ContainerEdits
-	PreparedMigDevices *PreparedMigDevices `json:"preparedMigDevices,omitempty"`
+	MpsControlDaemonID       string `json:"mpsControlDaemonID"`
+	containerEdits           *cdiapi.ContainerEdits
+	PreparedMigDevices       *PreparedMigDevices       `json:"preparedMigDevices,omitempty"`
+	PreparedFabricPartitions *PreparedFabricPartitions `json:"preparedFabricPartitions,omitempty"`
 }
 
 type DeviceState struct {
@@ -275,7 +277,7 @@ func (s *DeviceState) prepareDevices(ctx context.Context, claim *resourceapi.Res
 		return nil, fmt.Errorf("error getting opaque device configs: %v", err)
 	}
 
-	// Add the default GPU and MIG device Configs to the front of the config
+	// Add the default GPU, MIG device, and FabricManager Configs to the front of the config
 	// list with the lowest precedence. This guarantees there will be at least
 	// one of each config in the list with len(Requests) == 0 for the lookup below.
 	configs = slices.Insert(configs, 0, &OpaqueDeviceConfig{
@@ -285,6 +287,10 @@ func (s *DeviceState) prepareDevices(ctx context.Context, claim *resourceapi.Res
 	configs = slices.Insert(configs, 0, &OpaqueDeviceConfig{
 		Requests: []string{},
 		Config:   configapi.DefaultMigDeviceConfig(),
+	})
+	configs = slices.Insert(configs, 0, &OpaqueDeviceConfig{
+		Requests: []string{},
+		Config:   configapi.DefaultFabricManagerConfig(),
 	})
 
 	// Look through the configs and figure out which one will be applied to
@@ -306,6 +312,9 @@ func (s *DeviceState) prepareDevices(ctx context.Context, claim *resourceapi.Res
 				if _, ok := c.Config.(*configapi.MigDeviceConfig); ok && device.Type() != MigDeviceType {
 					return nil, fmt.Errorf("cannot apply MIG device config to request: %v", result.Request)
 				}
+				if _, ok := c.Config.(*configapi.FabricManagerConfig); ok && device.Type() != FabricPartitionType {
+					return nil, fmt.Errorf("cannot apply FabricManager config to request: %v", result.Request)
+				}
 				configResultsMap[c.Config] = append(configResultsMap[c.Config], &result)
 				break
 			}
@@ -314,6 +323,9 @@ func (s *DeviceState) prepareDevices(ctx context.Context, claim *resourceapi.Res
 					continue
 				}
 				if _, ok := c.Config.(*configapi.MigDeviceConfig); ok && device.Type() != MigDeviceType {
+					continue
+				}
+				if _, ok := c.Config.(*configapi.FabricManagerConfig); ok && device.Type() != FabricPartitionType {
 					continue
 				}
 				configResultsMap[c.Config] = append(configResultsMap[c.Config], &result)
@@ -333,6 +345,8 @@ func (s *DeviceState) prepareDevices(ctx context.Context, claim *resourceapi.Res
 		case *configapi.GpuConfig:
 			config = castConfig
 		case *configapi.MigDeviceConfig:
+			config = castConfig
+		case *configapi.FabricManagerConfig:
 			config = castConfig
 		default:
 			return nil, fmt.Errorf("runtime object is not a recognized configuration")
@@ -428,6 +442,13 @@ func (s *DeviceState) unprepareDevices(ctx context.Context, claimUID string, dev
 				return fmt.Errorf("error unpreparing MIG devices: %w", err)
 			}
 		}
+
+		// Clean up any prepared fabric partitions
+		if group.ConfigState.PreparedFabricPartitions != nil {
+			if err := s.unprepareFabricPartitions(claimUID, group.ConfigState.PreparedFabricPartitions); err != nil {
+				return fmt.Errorf("error unpreparing fabric partitions: %w", err)
+			}
+		}
 	}
 	return nil
 }
@@ -438,6 +459,8 @@ func (s *DeviceState) applyConfig(ctx context.Context, config configapi.Interfac
 		return s.applySharingConfig(ctx, castConfig.Sharing, claim, results)
 	case *configapi.MigDeviceConfig:
 		return s.applyMigDeviceConfig(ctx, castConfig, claim, results)
+	case *configapi.FabricManagerConfig:
+		return s.applyFabricManagerConfig(ctx, castConfig, claim, results)
 	default:
 		return nil, fmt.Errorf("unknown config type: %T", castConfig)
 	}
@@ -475,6 +498,81 @@ func (s *DeviceState) applyMigDeviceConfig(ctx context.Context, config *configap
 	}
 
 	return configState, nil
+}
+
+// applyFabricManagerConfig handles FabricManager device configuration and creation
+func (s *DeviceState) applyFabricManagerConfig(ctx context.Context, config *configapi.FabricManagerConfig, claim *resourceapi.ResourceClaim, results []*resourceapi.DeviceRequestAllocationResult) (*DeviceConfigState, error) {
+	// For FabricManager device configs, we need to create fabric partitions from the allocated GPUs
+	var allocatedFabricPartitions []AllocatedFabricPartition
+
+	for _, result := range results {
+		device := s.allocatable[result.Device]
+		if device.Type() != GpuDeviceType {
+			return nil, fmt.Errorf("FabricManager device config can only be applied to GPU devices, got %v", device.Type())
+		}
+
+		// Create fabric partitions for this GPU
+		fabricPartitions, err := s.createFabricManagerDevices(device.Gpu, config, claim)
+		if err != nil {
+			return nil, fmt.Errorf("error creating fabric partitions for GPU %s: %w", device.Gpu.UUID, err)
+		}
+
+		allocatedFabricPartitions = append(allocatedFabricPartitions, fabricPartitions...)
+	}
+
+	// Prepare the fabric partitions
+	preparedFabricPartitions, err := s.prepareFabricPartitions(string(claim.UID), allocatedFabricPartitions)
+	if err != nil {
+		return nil, fmt.Errorf("error preparing fabric partitions: %w", err)
+	}
+
+	// Generate container edits for fabric partitions
+	containerEdits, err := s.generateFabricPartitionContainerEdits(preparedFabricPartitions)
+	if err != nil {
+		return nil, fmt.Errorf("error generating container edits for fabric partitions: %w", err)
+	}
+
+	// Create device config state with prepared fabric partitions and container edits
+	configState := &DeviceConfigState{
+		PreparedFabricPartitions: preparedFabricPartitions,
+		containerEdits:           containerEdits,
+	}
+
+	return configState, nil
+}
+
+// generateFabricPartitionContainerEdits generates container edits for fabric partitions
+func (s *DeviceState) generateFabricPartitionContainerEdits(partitions *PreparedFabricPartitions) (*cdiapi.ContainerEdits, error) {
+	if partitions == nil || len(partitions.Partitions) == 0 {
+		return nil, nil
+	}
+
+	// For fabric partitions, we need to generate environment variables
+	// that expose the fabric partition information to containers
+	var envVars []string
+	var deviceNodes []*cdispec.DeviceNode
+
+	for _, partition := range partitions.Partitions {
+		// Add fabric partition environment variables
+		envVars = append(envVars, fmt.Sprintf("NVIDIA_FABRIC_PARTITION_%s_ID=%d", partition.PartitionName, partition.PartitionID))
+		envVars = append(envVars, fmt.Sprintf("NVIDIA_FABRIC_PARTITION_%s_CLIQUE_ID=%s", partition.PartitionName, partition.CliqueID))
+		envVars = append(envVars, fmt.Sprintf("NVIDIA_FABRIC_PARTITION_%s_PARENT_UUID=%s", partition.PartitionName, partition.ParentUUID))
+
+		// Add device node access (fabric partitions use the parent GPU device)
+		deviceNodes = append(deviceNodes, &cdispec.DeviceNode{
+			Path: fmt.Sprintf("/dev/nvidia%s", partition.ParentUUID[:8]),
+		})
+	}
+
+	// Create container edits
+	containerEdits := &cdiapi.ContainerEdits{
+		ContainerEdits: &cdispec.ContainerEdits{
+			Env:         envVars,
+			DeviceNodes: deviceNodes,
+		},
+	}
+
+	return containerEdits, nil
 }
 
 func (s *DeviceState) applySharingConfig(ctx context.Context, config configapi.Sharing, claim *resourceapi.ResourceClaim, results []*resourceapi.DeviceRequestAllocationResult) (*DeviceConfigState, error) {
@@ -812,6 +910,80 @@ func (s *DeviceState) validateMpsConfig(config *configapi.MpsConfig) error {
 	return nil
 }
 
+// FabricManager-related validation functions
+
+// validateGpuForFabricManagerCreation validates a GPU for FabricManager device creation
+func (s *DeviceState) validateGpuForFabricManagerCreation(gpu *GpuInfo) error {
+	if gpu == nil {
+		return fmt.Errorf("GPU cannot be nil")
+	}
+
+	// Check if GPU supports FabricManager
+	if !s.isFabricManagerCapable(gpu) {
+		return fmt.Errorf("GPU %s does not support FabricManager", gpu.UUID)
+	}
+
+	// Check if GPU is fabric-attached (skip if nvdevlib is not available for testing)
+	if s.nvdevlib != nil && s.nvdevlib.nvmllib != nil {
+		if !s.isFabricAttached(gpu) {
+			return fmt.Errorf("GPU %s is not fabric-attached", gpu.UUID)
+		}
+	}
+
+	// For Ampere: MIG-enabled GPUs cannot participate in fabric
+	if s.isAmpereArchitecture(gpu) && gpu.migEnabled {
+		return fmt.Errorf("GPU %s is MIG-enabled and cannot participate in fabric on Ampere architecture", gpu.UUID)
+	}
+
+	return nil
+}
+
+// isFabricManagerCapable checks if a GPU supports FabricManager
+func (s *DeviceState) isFabricManagerCapable(gpu *GpuInfo) bool {
+	// Check if architecture supports FabricManager
+	supportedArchitectures := []string{"Ampere", "Hopper", "Blackwell"}
+	for _, arch := range supportedArchitectures {
+		if gpu.architecture == arch {
+			return true
+		}
+	}
+	return false
+}
+
+// isFabricAttached checks if a GPU is fabric-attached
+func (s *DeviceState) isFabricAttached(gpu *GpuInfo) bool {
+	deviceHandle, ret := s.nvdevlib.nvmllib.DeviceGetHandleByUUID(gpu.UUID)
+	if ret != nvml.SUCCESS {
+		klog.Warningf("Failed to get device handle for GPU %s: %v", gpu.UUID, ret)
+		return false
+	}
+
+	// Use go-nvlib's IsFabricAttached method
+	device, err := s.nvdevlib.NewDevice(deviceHandle)
+	if err != nil {
+		klog.Warningf("Failed to create device for GPU %s: %v", gpu.UUID, err)
+		return false
+	}
+
+	fabricAttached, err := device.IsFabricAttached()
+	if err != nil {
+		klog.Warningf("Failed to check fabric attachment for GPU %s: %v", gpu.UUID, err)
+		return false
+	}
+
+	return fabricAttached
+}
+
+// isAmpereArchitecture checks if a GPU is Ampere architecture
+func (s *DeviceState) isAmpereArchitecture(gpu *GpuInfo) bool {
+	return gpu.architecture == "Ampere"
+}
+
+// isHopperArchitecture checks if a GPU is Hopper+ architecture (Hopper, Blackwell, etc.)
+func (s *DeviceState) isHopperArchitecture(gpu *GpuInfo) bool {
+	return gpu.architecture == "Hopper" || gpu.architecture == "Blackwell"
+}
+
 // validateGpuForMigCreation validates a GPU for MIG device creation
 func (s *DeviceState) validateGpuForMigCreation(gpu *GpuInfo) error {
 	if gpu == nil {
@@ -1132,4 +1304,177 @@ func (s *DeviceState) createMigDevices(gpu *GpuInfo, config *configapi.MigDevice
 	}
 
 	return []AllocatedMigDevice{migDevice}, nil
+}
+
+// FabricManager device creation functions
+
+// createFabricManagerDevices creates fabric partitions based on GPU capabilities and requirements
+func (s *DeviceState) createFabricManagerDevices(gpu *GpuInfo, config *configapi.FabricManagerConfig, claim *resourceapi.ResourceClaim) ([]AllocatedFabricPartition, error) {
+	// Validate input parameters
+	if err := s.validateResourceClaimForFabricManager(claim); err != nil {
+		return nil, fmt.Errorf("resource claim validation failed: %w", err)
+	}
+
+	if err := s.validateFabricManagerConfig(config); err != nil {
+		return nil, fmt.Errorf("FabricManager config validation failed: %w", err)
+	}
+
+	if err := s.validateGpuForFabricManagerCreation(gpu); err != nil {
+		return nil, fmt.Errorf("GPU validation failed: %w", err)
+	}
+
+	// Generate partition name if not specified
+	partitionName := config.Spec.PartitionName
+	if partitionName == "" {
+		partitionName = fmt.Sprintf("partition-%s", claim.UID)
+	}
+
+	// Get clique ID
+	cliqueID := config.Spec.CliqueID
+	if cliqueID == "" {
+		cliqueID = s.getCliqueID(gpu)
+	}
+
+	// Create fabric partition
+	fabricPartition := AllocatedFabricPartition{
+		ParentUUID:    gpu.UUID,
+		PartitionID:   0, // Will be assigned during preparation
+		PartitionName: partitionName,
+		CliqueID:      cliqueID,
+	}
+
+	return []AllocatedFabricPartition{fabricPartition}, nil
+}
+
+// prepareFabricPartitions prepares fabric partitions for use by containers
+func (s *DeviceState) prepareFabricPartitions(claimUID string, allocated []AllocatedFabricPartition) (*PreparedFabricPartitions, error) {
+	// Validate input parameters
+	if claimUID == "" {
+		return nil, fmt.Errorf("claim UID cannot be empty")
+	}
+
+	if len(allocated) == 0 {
+		return nil, fmt.Errorf("no fabric partitions to prepare")
+	}
+
+	prepared := &PreparedFabricPartitions{}
+
+	for i, partition := range allocated {
+		// Validate each partition before processing
+		if err := s.validateAllocatedFabricPartition(partition, i); err != nil {
+			return nil, fmt.Errorf("allocated fabric partition %d validation failed: %w", i, err)
+		}
+
+		if _, exists := s.allocatable[partition.ParentUUID]; !exists {
+			return nil, fmt.Errorf("allocated GPU does not exist: %v", partition.ParentUUID)
+		}
+
+		parent := s.allocatable[partition.ParentUUID]
+
+		// Validate GPU for FabricManager creation
+		if err := s.validateGpuForFabricManagerCreation(parent.Gpu); err != nil {
+			return nil, fmt.Errorf("GPU validation failed: %w", err)
+		}
+
+		// Create actual fabric partition using nvlib
+		fabricInfo, err := s.nvdevlib.createFabricPartition(parent.Gpu, partition.PartitionName, partition.CliqueID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create fabric partition %s: %w", partition.PartitionName, err)
+		}
+
+		prepared.Partitions = append(prepared.Partitions, fabricInfo)
+	}
+
+	return prepared, nil
+}
+
+// unprepareFabricPartitions cleans up fabric partitions after container use
+func (s *DeviceState) unprepareFabricPartitions(claimUID string, partitions *PreparedFabricPartitions) error {
+	if partitions == nil {
+		return nil
+	}
+
+	for _, partition := range partitions.Partitions {
+		// Delete the fabric partition using nvlib
+		if err := s.nvdevlib.deleteFabricPartition(partition); err != nil {
+			klog.Errorf("Failed to delete fabric partition %s: %v", partition.PartitionName, err)
+			// Continue with other partitions even if one fails
+		} else {
+			klog.Infof("Successfully cleaned up fabric partition %s for claim %s", partition.PartitionName, claimUID)
+		}
+	}
+
+	return nil
+}
+
+// validateAllocatedFabricPartition validates a single allocated fabric partition
+func (s *DeviceState) validateAllocatedFabricPartition(partition AllocatedFabricPartition, index int) error {
+	if partition.ParentUUID == "" {
+		return fmt.Errorf("parent UUID cannot be empty")
+	}
+
+	if partition.PartitionName == "" {
+		return fmt.Errorf("partition name cannot be empty")
+	}
+
+	if partition.CliqueID == "" {
+		return fmt.Errorf("clique ID cannot be empty")
+	}
+
+	return nil
+}
+
+// validateFabricManagerConfig validates the FabricManager configuration
+func (s *DeviceState) validateFabricManagerConfig(config *configapi.FabricManagerConfig) error {
+	if config == nil {
+		return fmt.Errorf("FabricManager config cannot be nil")
+	}
+
+	// Validate sharing strategy
+	if config.Spec.Sharing != nil {
+		if config.Spec.Sharing.Strategy != configapi.FabricManagerSharingStrategyExclusive {
+			return fmt.Errorf("invalid sharing strategy: %s", config.Spec.Sharing.Strategy)
+		}
+	}
+
+	return nil
+}
+
+// validateResourceClaimForFabricManager validates a resource claim for FabricManager allocation
+func (s *DeviceState) validateResourceClaimForFabricManager(claim *resourceapi.ResourceClaim) error {
+	if claim == nil {
+		return fmt.Errorf("resource claim cannot be nil")
+	}
+
+	if claim.UID == "" {
+		return fmt.Errorf("resource claim UID cannot be empty")
+	}
+
+	if claim.Name == "" {
+		return fmt.Errorf("resource claim name cannot be empty")
+	}
+
+	if claim.Namespace == "" {
+		return fmt.Errorf("resource claim namespace cannot be empty")
+	}
+
+	return nil
+}
+
+// getCliqueID gets the clique ID for a GPU
+func (s *DeviceState) getCliqueID(gpu *GpuInfo) string {
+	deviceHandle, ret := s.nvdevlib.nvmllib.DeviceGetHandleByUUID(gpu.UUID)
+	if ret != nvml.SUCCESS {
+		klog.Warningf("Failed to get device handle for GPU %s: %v", gpu.UUID, ret)
+		return ""
+	}
+
+	// Get fabric info to extract clique ID
+	fabricInfo, ret := deviceHandle.GetGpuFabricInfo()
+	if ret != nvml.SUCCESS {
+		klog.Warningf("Failed to get fabric info for GPU %s: %v", gpu.UUID, ret)
+		return ""
+	}
+
+	return fmt.Sprintf("%d", fabricInfo.CliqueId)
 }

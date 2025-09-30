@@ -205,3 +205,32 @@ func (d *MigDeviceInfo) GetDevice() resourceapi.Device {
 	}
 	return device
 }
+
+// FabricManager-related types
+
+// FabricPartitionInfo represents a fabric partition configuration
+type FabricPartitionInfo struct {
+	PartitionID   int    `json:"partitionId"`
+	PartitionName string `json:"partitionName"`
+	ParentUUID    string `json:"parentUUID"`
+	CliqueID      string `json:"cliqueId"`
+	State         string `json:"state"`
+}
+
+// AllocatedFabricPartition represents a fabric partition that has been allocated for a claim
+type AllocatedFabricPartition struct {
+	ParentUUID    string `json:"parentUUID"`
+	PartitionID   int    `json:"partitionId"`
+	PartitionName string `json:"partitionName"`
+	CliqueID      string `json:"cliqueId"`
+}
+
+// PreparedFabricPartitions represents a collection of prepared fabric partitions
+type PreparedFabricPartitions struct {
+	Partitions []*FabricPartitionInfo `json:"partitions"`
+}
+
+// Device type constants
+const (
+	FabricPartitionType = "fabric-partition"
+)

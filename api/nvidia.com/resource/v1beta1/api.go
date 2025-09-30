@@ -66,6 +66,7 @@ func init() {
 	scheme.AddKnownTypes(schemeGroupVersion,
 		&GpuConfig{},
 		&MigDeviceConfig{},
+		&FabricManagerConfig{},
 		&ComputeDomainChannelConfig{},
 		&ComputeDomainDaemonConfig{},
 		&ComputeDomain{},
