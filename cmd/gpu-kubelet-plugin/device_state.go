@@ -22,6 +22,7 @@ import (
 	"slices"
 	"sync"
 
+	"github.com/NVIDIA/go-nvml/pkg/nvml"
 	resourceapi "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/dynamic-resource-allocation/kubeletplugin"
@@ -41,6 +42,7 @@ type OpaqueDeviceConfig struct {
 type DeviceConfigState struct {
 	MpsControlDaemonID string `json:"mpsControlDaemonID"`
 	containerEdits     *cdiapi.ContainerEdits
+	PreparedMigDevices *PreparedMigDevices `json:"preparedMigDevices,omitempty"`
 }
 
 type DeviceState struct {
@@ -550,50 +552,134 @@ func GetOpaqueDeviceConfigs(
 	return resultConfigs, nil
 }
 
-// TODO: Dynamic MIG is not yet supported with structured parameters.
-// Refactor this to allow for the allocation of statically partitioned MIG
-// devices.
-//
-// func (s *DeviceState) prepareMigDevices(claimUID string, allocated *nascrd.AllocatedMigDevices) (*PreparedMigDevices, error) {
-// 	prepared := &PreparedMigDevices{}
-//
-// 	for _, device := range allocated.Devices {
-// 		if _, exists := s.allocatable[device.ParentUUID]; !exists {
-// 			return nil, fmt.Errorf("allocated GPU does not exist: %v", device.ParentUUID)
-// 		}
-//
-// 		parent := s.allocatable[device.ParentUUID]
-//
-// 		if !parent.migEnabled {
-// 			return nil, fmt.Errorf("cannot prepare a GPU with MIG mode disabled: %v", device.ParentUUID)
-// 		}
-//
-// 		if _, exists := parent.migProfiles[device.Profile]; !exists {
-// 			return nil, fmt.Errorf("MIG profile %v does not exist on GPU: %v", device.Profile, device.ParentUUID)
-// 		}
-//
-// 		placement := nvml.GpuInstancePlacement{
-// 			Start: uint32(device.Placement.Start),
-// 			Size:  uint32(device.Placement.Size),
-// 		}
-//
-// 		migInfo, err := s.nvdevlib.createMigDevice(parent.GpuInfo, parent.migProfiles[device.Profile].profile, &placement)
-// 		if err != nil {
-// 			return nil, fmt.Errorf("error creating MIG device: %w", err)
-// 		}
-//
-// 		prepared.Devices = append(prepared.Devices, migInfo)
-// 	}
-//
-// 	return prepared, nil
-// }
-//
-// func (s *DeviceState) unprepareMigDevices(claimUID string, devices *PreparedDevices) error {
-// 	for _, device := range devices.Mig.Devices {
-// 		err := s.nvdevlib.deleteMigDevice(device)
-// 		if err != nil {
-// 			return fmt.Errorf("error deleting MIG device for %v: %w", device.uuid, err)
-// 		}
-// 	}
-// 	return nil
-//}
+// MIG-related types and structures
+
+// AllocatedMigDevice represents a MIG device that has been allocated for a claim.
+type AllocatedMigDevice struct {
+	ParentUUID string `json:"parentUUID"`
+	Profile    string `json:"profile"`
+	Placement  struct {
+		Start int `json:"start"`
+		Size  int `json:"size"`
+	} `json:"placement"`
+}
+
+// AllocatedMigDevices represents a collection of allocated MIG devices.
+type AllocatedMigDevices struct {
+	Devices []AllocatedMigDevice `json:"devices"`
+}
+
+// PreparedMigDevices represents a collection of prepared MIG devices.
+type PreparedMigDevices struct {
+	Devices []*MigDeviceInfo `json:"devices"`
+}
+
+// prepareMigDevices prepares MIG devices for use by containers
+func (s *DeviceState) prepareMigDevices(claimUID string, allocated *AllocatedMigDevices) (*PreparedMigDevices, error) {
+	// Validate input parameters
+	if claimUID == "" {
+		return nil, fmt.Errorf("claim UID cannot be empty")
+	}
+
+	if allocated == nil {
+		return nil, fmt.Errorf("allocated MIG devices cannot be nil")
+	}
+
+	if len(allocated.Devices) == 0 {
+		return nil, fmt.Errorf("no MIG devices to prepare")
+	}
+
+	prepared := &PreparedMigDevices{}
+
+	for i, device := range allocated.Devices {
+		// Validate each device before processing
+		if err := s.validateAllocatedMigDevice(device, i); err != nil {
+			return nil, fmt.Errorf("allocated MIG device %d validation failed: %w", i, err)
+		}
+
+		if _, exists := s.allocatable[device.ParentUUID]; !exists {
+			return nil, fmt.Errorf("allocated GPU does not exist: %v", device.ParentUUID)
+		}
+
+		parent := s.allocatable[device.ParentUUID]
+
+		if !parent.Gpu.migEnabled {
+			return nil, fmt.Errorf("cannot prepare a GPU with MIG mode disabled: %v", device.ParentUUID)
+		}
+
+		// Find the MIG profile by string representation
+		var migProfile *MigProfileInfo
+		for _, profile := range parent.Gpu.migProfiles {
+			if profile.String() == device.Profile {
+				migProfile = profile
+				break
+			}
+		}
+		if migProfile == nil {
+			return nil, fmt.Errorf("MIG profile %v does not exist on GPU: %v", device.Profile, device.ParentUUID)
+		}
+
+		// Get the GpuInstanceProfileInfo from the device
+		profileInfo := migProfile.profile.GetInfo()
+		deviceHandle, ret := s.nvdevlib.nvmllib.DeviceGetHandleByUUID(parent.Gpu.UUID)
+		if ret != nvml.SUCCESS {
+			return nil, fmt.Errorf("error getting GPU device handle: %v", ret)
+		}
+
+		giProfileInfo, ret := deviceHandle.GetGpuInstanceProfileInfo(profileInfo.GIProfileID)
+		if ret != nvml.SUCCESS {
+			return nil, fmt.Errorf("error getting GPU instance profile info for profile %v: %v", device.Profile, ret)
+		}
+
+		placement := nvml.GpuInstancePlacement{
+			Start: uint32(device.Placement.Start),
+			Size:  uint32(device.Placement.Size),
+		}
+
+		migInfo, err := s.nvdevlib.createMigDevice(parent.Gpu, giProfileInfo, &placement)
+		if err != nil {
+			return nil, fmt.Errorf("error creating MIG device: %w", err)
+		}
+
+		prepared.Devices = append(prepared.Devices, migInfo)
+	}
+
+	return prepared, nil
+}
+
+// unprepareMigDevices cleans up MIG devices after container use
+func (s *DeviceState) unprepareMigDevices(claimUID string, devices *PreparedMigDevices) error {
+	if devices == nil {
+		return nil
+	}
+
+	for _, device := range devices.Devices {
+		err := s.nvdevlib.deleteMigDevice(device)
+		if err != nil {
+			return fmt.Errorf("error deleting MIG device for %v: %w", device.UUID, err)
+		}
+	}
+
+	return nil
+}
+
+// validateAllocatedMigDevice validates a single allocated MIG device
+func (s *DeviceState) validateAllocatedMigDevice(device AllocatedMigDevice, index int) error {
+	if device.ParentUUID == "" {
+		return fmt.Errorf("parent UUID cannot be empty")
+	}
+
+	if device.Profile == "" {
+		return fmt.Errorf("profile cannot be empty")
+	}
+
+	if device.Placement.Start < 0 {
+		return fmt.Errorf("placement start must be non-negative")
+	}
+
+	if device.Placement.Size <= 0 {
+		return fmt.Errorf("placement size must be positive")
+	}
+
+	return nil
+}
