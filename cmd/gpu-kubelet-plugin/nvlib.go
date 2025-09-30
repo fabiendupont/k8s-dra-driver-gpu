@@ -491,12 +491,12 @@ func (l *deviceLib) deleteMigDevice(mig *MigDeviceInfo) error {
 	if ret != nvml.SUCCESS {
 		return fmt.Errorf("error getting device from UUID '%v': %v", mig.parent.UUID, ret)
 	}
-	
+
 	gi, ret := parent.GetGpuInstanceById(int(mig.giInfo.Id))
 	if ret != nvml.SUCCESS {
 		return fmt.Errorf("error getting GPU instance ID for MIG device: %v", ret)
 	}
-	
+
 	ret = gi.Destroy()
 	if ret != nvml.SUCCESS {
 		return fmt.Errorf("error destroying GPU Instance: %v", ret)

@@ -421,6 +421,13 @@ func (s *DeviceState) unprepareDevices(ctx context.Context, claimUID string, dev
 				return fmt.Errorf("error setting timeslice for devices: %w", err)
 			}
 		}
+
+		// Clean up any prepared MIG devices
+		if group.ConfigState.PreparedMigDevices != nil {
+			if err := s.unprepareMigDevices(claimUID, group.ConfigState.PreparedMigDevices); err != nil {
+				return fmt.Errorf("error unpreparing MIG devices: %w", err)
+			}
+		}
 	}
 	return nil
 }
@@ -430,10 +437,44 @@ func (s *DeviceState) applyConfig(ctx context.Context, config configapi.Interfac
 	case *configapi.GpuConfig:
 		return s.applySharingConfig(ctx, castConfig.Sharing, claim, results)
 	case *configapi.MigDeviceConfig:
-		return s.applySharingConfig(ctx, castConfig.Sharing, claim, results)
+		return s.applyMigDeviceConfig(ctx, castConfig, claim, results)
 	default:
 		return nil, fmt.Errorf("unknown config type: %T", castConfig)
 	}
+}
+
+// applyMigDeviceConfig handles MIG device configuration and creation
+func (s *DeviceState) applyMigDeviceConfig(ctx context.Context, config *configapi.MigDeviceConfig, claim *resourceapi.ResourceClaim, results []*resourceapi.DeviceRequestAllocationResult) (*DeviceConfigState, error) {
+	// For MIG device configs, we need to create MIG devices from the allocated GPUs
+	var allocatedMigDevices AllocatedMigDevices
+	
+	for _, result := range results {
+		device := s.allocatable[result.Device]
+		if device.Type() != GpuDeviceType {
+			return nil, fmt.Errorf("MIG device config can only be applied to GPU devices, got %v", device.Type())
+		}
+		
+		// Create MIG devices for this GPU
+		migDevices, err := s.createMigDevices(device.Gpu, config, claim)
+		if err != nil {
+			return nil, fmt.Errorf("error creating MIG devices for GPU %s: %w", device.Gpu.UUID, err)
+		}
+		
+		allocatedMigDevices.Devices = append(allocatedMigDevices.Devices, migDevices...)
+	}
+	
+	// Prepare the MIG devices
+	preparedMigDevices, err := s.prepareMigDevices(string(claim.UID), &allocatedMigDevices)
+	if err != nil {
+		return nil, fmt.Errorf("error preparing MIG devices: %w", err)
+	}
+	
+	// Create device config state with prepared MIG devices
+	configState := &DeviceConfigState{
+		PreparedMigDevices: preparedMigDevices,
+	}
+	
+	return configState, nil
 }
 
 func (s *DeviceState) applySharingConfig(ctx context.Context, config configapi.Sharing, claim *resourceapi.ResourceClaim, results []*resourceapi.DeviceRequestAllocationResult) (*DeviceConfigState, error) {
@@ -682,4 +723,128 @@ func (s *DeviceState) validateAllocatedMigDevice(device AllocatedMigDevice, inde
 	}
 
 	return nil
+}
+
+// selectMigProfile selects an appropriate MIG profile based on GPU capabilities and requirements
+func (s *DeviceState) selectMigProfile(gpu *GpuInfo, config *configapi.MigDeviceConfig) string {
+	if len(gpu.migProfiles) == 0 {
+		return ""
+	}
+
+	// Simple selection strategy: prefer smaller profiles for better resource utilization
+	var bestProfile *MigProfileInfo
+	var bestScore int = -1
+
+	for _, profile := range gpu.migProfiles {
+		score := s.calculateProfileScore(profile, gpu, config)
+		if score > bestScore {
+			bestScore = score
+			bestProfile = profile
+		}
+	}
+
+	if bestProfile != nil {
+		return bestProfile.String()
+	}
+
+	// Fallback to first available profile
+	return gpu.migProfiles[0].String()
+}
+
+// calculateProfileScore calculates a score for a MIG profile based on various factors
+func (s *DeviceState) calculateProfileScore(profile *MigProfileInfo, gpu *GpuInfo, config *configapi.MigDeviceConfig) int {
+	score := 0
+
+	// Get profile information
+	profileInfo := profile.profile.GetInfo()
+
+	// Prefer profiles with fewer compute slices (more efficient resource usage)
+	// Lower slice count = higher score
+	maxSlices := s.getMaxComputeSlices(gpu)
+	if maxSlices > 0 {
+		sliceScore := maxSlices - profileInfo.C
+		score += sliceScore * 10 // Weight compute slices heavily
+	}
+
+	// Prefer profiles with smaller memory footprint
+	// Lower memory = higher score (allows more MIG instances)
+	if gpu.memoryBytes > 0 {
+		memoryScore := int(gpu.memoryBytes/1024/1024/1024) - profileInfo.GB
+		score += memoryScore * 2 // Weight memory moderately
+	}
+
+	// Prefer profiles with more placement options
+	placementScore := len(profile.placements)
+	score += placementScore * 5 // Weight placement options moderately
+
+	return score
+}
+
+// getMaxComputeSlices returns the maximum number of compute slices for the GPU architecture
+func (s *DeviceState) getMaxComputeSlices(gpu *GpuInfo) int {
+	switch gpu.architecture {
+	case "Hopper", "Blackwell":
+		return 8 // Hopper+ GPUs have up to 8 compute slices
+	case "Ampere":
+		return 7 // A100 GPUs have up to 7 compute slices
+	default:
+		return 7 // Default to A100-like behavior
+	}
+}
+
+// createMigDevices creates MIG devices based on GPU capabilities and requirements
+func (s *DeviceState) createMigDevices(gpu *GpuInfo, config *configapi.MigDeviceConfig, claim *resourceapi.ResourceClaim) ([]AllocatedMigDevice, error) {
+	// Validate input parameters
+	if gpu == nil {
+		return nil, fmt.Errorf("GPU cannot be nil")
+	}
+	if config == nil {
+		return nil, fmt.Errorf("MIG config cannot be nil")
+	}
+	if claim == nil {
+		return nil, fmt.Errorf("claim cannot be nil")
+	}
+
+	// Check if GPU is MIG-enabled
+	if !gpu.migEnabled {
+		return nil, fmt.Errorf("GPU %s does not have MIG mode enabled", gpu.UUID)
+	}
+
+	// Check if GPU has available MIG profiles
+	if len(gpu.migProfiles) == 0 {
+		return nil, fmt.Errorf("GPU %s has no available MIG profiles", gpu.UUID)
+	}
+
+	// Select optimal profile
+	profile := s.selectMigProfile(gpu, config)
+	if profile == "" {
+		return nil, fmt.Errorf("failed to select MIG profile for GPU %s", gpu.UUID)
+	}
+
+	// Find the selected profile
+	var selectedProfile *MigProfileInfo
+	for _, p := range gpu.migProfiles {
+		if p.String() == profile {
+			selectedProfile = p
+			break
+		}
+	}
+	if selectedProfile == nil {
+		return nil, fmt.Errorf("selected MIG profile %s not found on GPU %s", profile, gpu.UUID)
+	}
+
+	// Create MIG device with simple placement (start at 0, size 1)
+	migDevice := AllocatedMigDevice{
+		ParentUUID: gpu.UUID,
+		Profile:    profile,
+		Placement: struct {
+			Start int `json:"start"`
+			Size  int `json:"size"`
+		}{
+			Start: 0,
+			Size:  1,
+		},
+	}
+
+	return []AllocatedMigDevice{migDevice}, nil
 }
