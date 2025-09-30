@@ -447,33 +447,33 @@ func (s *DeviceState) applyConfig(ctx context.Context, config configapi.Interfac
 func (s *DeviceState) applyMigDeviceConfig(ctx context.Context, config *configapi.MigDeviceConfig, claim *resourceapi.ResourceClaim, results []*resourceapi.DeviceRequestAllocationResult) (*DeviceConfigState, error) {
 	// For MIG device configs, we need to create MIG devices from the allocated GPUs
 	var allocatedMigDevices AllocatedMigDevices
-	
+
 	for _, result := range results {
 		device := s.allocatable[result.Device]
 		if device.Type() != GpuDeviceType {
 			return nil, fmt.Errorf("MIG device config can only be applied to GPU devices, got %v", device.Type())
 		}
-		
+
 		// Create MIG devices for this GPU
 		migDevices, err := s.createMigDevices(device.Gpu, config, claim)
 		if err != nil {
 			return nil, fmt.Errorf("error creating MIG devices for GPU %s: %w", device.Gpu.UUID, err)
 		}
-		
+
 		allocatedMigDevices.Devices = append(allocatedMigDevices.Devices, migDevices...)
 	}
-	
+
 	// Prepare the MIG devices
 	preparedMigDevices, err := s.prepareMigDevices(string(claim.UID), &allocatedMigDevices)
 	if err != nil {
 		return nil, fmt.Errorf("error preparing MIG devices: %w", err)
 	}
-	
+
 	// Create device config state with prepared MIG devices
 	configState := &DeviceConfigState{
 		PreparedMigDevices: preparedMigDevices,
 	}
-	
+
 	return configState, nil
 }
 
@@ -644,8 +644,9 @@ func (s *DeviceState) prepareMigDevices(claimUID string, allocated *AllocatedMig
 
 		parent := s.allocatable[device.ParentUUID]
 
-		if !parent.Gpu.migEnabled {
-			return nil, fmt.Errorf("cannot prepare a GPU with MIG mode disabled: %v", device.ParentUUID)
+		// Validate GPU for MIG creation
+		if err := s.validateGpuForMigCreation(parent.Gpu); err != nil {
+			return nil, fmt.Errorf("GPU validation failed: %w", err)
 		}
 
 		// Find the MIG profile by string representation
@@ -658,6 +659,11 @@ func (s *DeviceState) prepareMigDevices(claimUID string, allocated *AllocatedMig
 		}
 		if migProfile == nil {
 			return nil, fmt.Errorf("MIG profile %v does not exist on GPU: %v", device.Profile, device.ParentUUID)
+		}
+
+		// Validate the MIG profile
+		if err := s.validateMigProfile(migProfile, parent.Gpu); err != nil {
+			return nil, fmt.Errorf("MIG profile validation failed: %w", err)
 		}
 
 		// Get the GpuInstanceProfileInfo from the device
@@ -675,6 +681,11 @@ func (s *DeviceState) prepareMigDevices(claimUID string, allocated *AllocatedMig
 		placement := nvml.GpuInstancePlacement{
 			Start: uint32(device.Placement.Start),
 			Size:  uint32(device.Placement.Size),
+		}
+
+		// Validate placement
+		if err := s.validateMigPlacement(&placement, parent.Gpu); err != nil {
+			return nil, fmt.Errorf("MIG placement validation failed: %w", err)
 		}
 
 		migInfo, err := s.nvdevlib.createMigDevice(parent.Gpu, giProfileInfo, &placement)
@@ -720,6 +731,269 @@ func (s *DeviceState) validateAllocatedMigDevice(device AllocatedMigDevice, inde
 
 	if device.Placement.Size <= 0 {
 		return fmt.Errorf("placement size must be positive")
+	}
+
+	return nil
+}
+
+// validateMigDeviceConfig validates the MIG device configuration
+func (s *DeviceState) validateMigDeviceConfig(config *configapi.MigDeviceConfig) error {
+	if config == nil {
+		return fmt.Errorf("MIG device config cannot be nil")
+	}
+
+	// Validate the config using the built-in validation
+	if err := config.Validate(); err != nil {
+		return fmt.Errorf("MIG device config validation failed: %w", err)
+	}
+
+	// Additional validation for sharing configuration
+	if config.Sharing != nil {
+		if err := s.validateMigDeviceSharing(config.Sharing); err != nil {
+			return fmt.Errorf("MIG device sharing validation failed: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// validateMigDeviceSharing validates the MIG device sharing configuration
+func (s *DeviceState) validateMigDeviceSharing(sharing *configapi.MigDeviceSharing) error {
+	if sharing == nil {
+		return nil
+	}
+
+	// Validate strategy
+	switch sharing.Strategy {
+	case configapi.TimeSlicingStrategy, configapi.MpsStrategy:
+		// Valid strategies
+	default:
+		return fmt.Errorf("invalid sharing strategy: %s", sharing.Strategy)
+	}
+
+	// Validate MPS configuration if MPS strategy is used
+	if sharing.Strategy == configapi.MpsStrategy {
+		if err := s.validateMpsConfig(sharing.MpsConfig); err != nil {
+			return fmt.Errorf("MPS config validation failed: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// validateMpsConfig validates the MPS configuration
+func (s *DeviceState) validateMpsConfig(config *configapi.MpsConfig) error {
+	if config == nil {
+		return nil
+	}
+
+	// Validate active thread percentage
+	if config.DefaultActiveThreadPercentage != nil {
+		percentage := *config.DefaultActiveThreadPercentage
+		if percentage < 1 || percentage > 100 {
+			return fmt.Errorf("active thread percentage must be between 1 and 100, got %d", percentage)
+		}
+	}
+
+	// Validate pinned memory limits
+	if config.DefaultPinnedDeviceMemoryLimit != nil {
+		if config.DefaultPinnedDeviceMemoryLimit.Value() <= 0 {
+			return fmt.Errorf("default pinned device memory limit must be positive")
+		}
+	}
+
+	// Validate per-device pinned memory limits
+	for deviceKey, limit := range config.DefaultPerDevicePinnedMemoryLimit {
+		if limit.Value() <= 0 {
+			return fmt.Errorf("pinned memory limit for device %s must be positive", deviceKey)
+		}
+	}
+
+	return nil
+}
+
+// validateGpuForMigCreation validates a GPU for MIG device creation
+func (s *DeviceState) validateGpuForMigCreation(gpu *GpuInfo) error {
+	if gpu == nil {
+		return fmt.Errorf("GPU cannot be nil")
+	}
+
+	// Check if GPU is MIG-enabled
+	if !gpu.migEnabled {
+		return fmt.Errorf("GPU %s does not have MIG mode enabled", gpu.UUID)
+	}
+
+	// Check if GPU has available MIG profiles
+	if len(gpu.migProfiles) == 0 {
+		return fmt.Errorf("GPU %s has no available MIG profiles", gpu.UUID)
+	}
+
+	// Validate GPU architecture compatibility
+	if err := s.validateGpuArchitectureForMig(gpu); err != nil {
+		return fmt.Errorf("GPU architecture validation failed: %w", err)
+	}
+
+	// Validate GPU memory requirements
+	if err := s.validateGpuMemoryForMig(gpu); err != nil {
+		return fmt.Errorf("GPU memory validation failed: %w", err)
+	}
+
+	return nil
+}
+
+// validateGpuArchitectureForMig validates GPU architecture for MIG compatibility
+func (s *DeviceState) validateGpuArchitectureForMig(gpu *GpuInfo) error {
+	if gpu.architecture == "" {
+		return fmt.Errorf("GPU architecture is not specified")
+	}
+
+	// Check if architecture supports MIG
+	supportedArchitectures := []string{"Ampere", "Hopper", "Blackwell"}
+	isSupported := false
+	for _, arch := range supportedArchitectures {
+		if gpu.architecture == arch {
+			isSupported = true
+			break
+		}
+	}
+
+	if !isSupported {
+		return fmt.Errorf("GPU architecture %s does not support MIG", gpu.architecture)
+	}
+
+	return nil
+}
+
+// validateGpuMemoryForMig validates GPU memory requirements for MIG
+func (s *DeviceState) validateGpuMemoryForMig(gpu *GpuInfo) error {
+	if gpu.memoryBytes == 0 {
+		return fmt.Errorf("GPU memory size is not specified")
+	}
+
+	// Check minimum memory requirements for MIG
+	minMemoryBytes := s.getMinMemoryForMig(gpu.architecture)
+	if gpu.memoryBytes < minMemoryBytes {
+		return fmt.Errorf("GPU memory %d bytes is below minimum required %d bytes for MIG on %s architecture",
+			gpu.memoryBytes, minMemoryBytes, gpu.architecture)
+	}
+
+	return nil
+}
+
+// getMinMemoryForMig returns the minimum memory required for MIG on a given architecture
+func (s *DeviceState) getMinMemoryForMig(architecture string) uint64 {
+	switch architecture {
+	case "Ampere":
+		return 40 * 1024 * 1024 * 1024 // 40GB minimum for A100
+	case "Hopper", "Blackwell":
+		return 80 * 1024 * 1024 * 1024 // 80GB minimum for H100+
+	default:
+		return 40 * 1024 * 1024 * 1024 // Default to A100 minimum
+	}
+}
+
+// validateMigProfile validates a MIG profile for a specific GPU
+func (s *DeviceState) validateMigProfile(profile *MigProfileInfo, gpu *GpuInfo) error {
+	if profile == nil {
+		return fmt.Errorf("MIG profile cannot be nil")
+	}
+
+	if gpu == nil {
+		return fmt.Errorf("GPU cannot be nil")
+	}
+
+	// Validate profile string format
+	profileStr := profile.String()
+	if profileStr == "" {
+		return fmt.Errorf("MIG profile string cannot be empty")
+	}
+
+	// Validate profile is available on the GPU
+	found := false
+	for _, gpuProfile := range gpu.migProfiles {
+		if gpuProfile.String() == profileStr {
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return fmt.Errorf("MIG profile %s is not available on GPU %s", profileStr, gpu.UUID)
+	}
+
+	// Validate profile memory requirements
+	if err := s.validateProfileMemoryRequirements(profile, gpu); err != nil {
+		return fmt.Errorf("profile memory validation failed: %w", err)
+	}
+
+	return nil
+}
+
+// validateProfileMemoryRequirements validates memory requirements for a MIG profile
+func (s *DeviceState) validateProfileMemoryRequirements(profile *MigProfileInfo, gpu *GpuInfo) error {
+	profileInfo := profile.profile.GetInfo()
+
+	// Check if profile memory is within GPU memory limits
+	profileMemoryBytes := uint64(profileInfo.GB) * 1024 * 1024 * 1024
+	if profileMemoryBytes > gpu.memoryBytes {
+		return fmt.Errorf("profile memory %d bytes exceeds GPU memory %d bytes",
+			profileMemoryBytes, gpu.memoryBytes)
+	}
+
+	// Check minimum profile memory
+	minProfileMemoryBytes := uint64(1 * 1024 * 1024 * 1024) // 1GB minimum
+	if profileMemoryBytes < minProfileMemoryBytes {
+		return fmt.Errorf("profile memory %d bytes is below minimum 1GB", profileMemoryBytes)
+	}
+
+	return nil
+}
+
+// validateMigPlacement validates MIG device placement
+func (s *DeviceState) validateMigPlacement(placement *nvml.GpuInstancePlacement, gpu *GpuInfo) error {
+	if placement == nil {
+		return fmt.Errorf("placement cannot be nil")
+	}
+
+	if gpu == nil {
+		return fmt.Errorf("GPU cannot be nil")
+	}
+
+	// Validate placement bounds (Start is uint32, so it's always >= 0)
+
+	if placement.Size <= 0 {
+		return fmt.Errorf("placement size %d must be positive", placement.Size)
+	}
+
+	// Validate placement doesn't exceed GPU limits
+	maxSlices := s.getMaxComputeSlices(gpu)
+	if int(placement.Start+placement.Size) > maxSlices {
+		return fmt.Errorf("placement range [%d, %d) exceeds maximum slices %d",
+			placement.Start, placement.Start+placement.Size, maxSlices)
+	}
+
+	return nil
+}
+
+// validateResourceClaimForMig validates a resource claim for MIG device allocation
+func (s *DeviceState) validateResourceClaimForMig(claim *resourceapi.ResourceClaim) error {
+	if claim == nil {
+		return fmt.Errorf("resource claim cannot be nil")
+	}
+
+	// Validate claim UID
+	if claim.UID == "" {
+		return fmt.Errorf("resource claim UID cannot be empty")
+	}
+
+	// Validate claim name
+	if claim.Name == "" {
+		return fmt.Errorf("resource claim name cannot be empty")
+	}
+
+	// Validate claim namespace
+	if claim.Namespace == "" {
+		return fmt.Errorf("resource claim namespace cannot be empty")
 	}
 
 	return nil
@@ -794,25 +1068,17 @@ func (s *DeviceState) getMaxComputeSlices(gpu *GpuInfo) int {
 
 // createMigDevices creates MIG devices based on GPU capabilities and requirements
 func (s *DeviceState) createMigDevices(gpu *GpuInfo, config *configapi.MigDeviceConfig, claim *resourceapi.ResourceClaim) ([]AllocatedMigDevice, error) {
-	// Validate input parameters
-	if gpu == nil {
-		return nil, fmt.Errorf("GPU cannot be nil")
-	}
-	if config == nil {
-		return nil, fmt.Errorf("MIG config cannot be nil")
-	}
-	if claim == nil {
-		return nil, fmt.Errorf("claim cannot be nil")
+	// Comprehensive validation of input parameters
+	if err := s.validateResourceClaimForMig(claim); err != nil {
+		return nil, fmt.Errorf("resource claim validation failed: %w", err)
 	}
 
-	// Check if GPU is MIG-enabled
-	if !gpu.migEnabled {
-		return nil, fmt.Errorf("GPU %s does not have MIG mode enabled", gpu.UUID)
+	if err := s.validateMigDeviceConfig(config); err != nil {
+		return nil, fmt.Errorf("MIG device config validation failed: %w", err)
 	}
 
-	// Check if GPU has available MIG profiles
-	if len(gpu.migProfiles) == 0 {
-		return nil, fmt.Errorf("GPU %s has no available MIG profiles", gpu.UUID)
+	if err := s.validateGpuForMigCreation(gpu); err != nil {
+		return nil, fmt.Errorf("GPU validation failed: %w", err)
 	}
 
 	// Select optimal profile
@@ -833,7 +1099,21 @@ func (s *DeviceState) createMigDevices(gpu *GpuInfo, config *configapi.MigDevice
 		return nil, fmt.Errorf("selected MIG profile %s not found on GPU %s", profile, gpu.UUID)
 	}
 
-	// Create MIG device with simple placement (start at 0, size 1)
+	// Validate the selected profile
+	if err := s.validateMigProfile(selectedProfile, gpu); err != nil {
+		return nil, fmt.Errorf("MIG profile validation failed: %w", err)
+	}
+
+	// Create placement and validate it
+	placement := nvml.GpuInstancePlacement{
+		Start: 0,
+		Size:  1,
+	}
+	if err := s.validateMigPlacement(&placement, gpu); err != nil {
+		return nil, fmt.Errorf("MIG placement validation failed: %w", err)
+	}
+
+	// Create MIG device with validated placement
 	migDevice := AllocatedMigDevice{
 		ParentUUID: gpu.UUID,
 		Profile:    profile,
@@ -841,9 +1121,14 @@ func (s *DeviceState) createMigDevices(gpu *GpuInfo, config *configapi.MigDevice
 			Start int `json:"start"`
 			Size  int `json:"size"`
 		}{
-			Start: 0,
-			Size:  1,
+			Start: int(placement.Start),
+			Size:  int(placement.Size),
 		},
+	}
+
+	// Validate the created device
+	if err := s.validateAllocatedMigDevice(migDevice, 0); err != nil {
+		return nil, fmt.Errorf("allocated MIG device validation failed: %w", err)
 	}
 
 	return []AllocatedMigDevice{migDevice}, nil
