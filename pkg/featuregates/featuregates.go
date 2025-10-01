@@ -72,6 +72,9 @@ var defaultFeatureGates = map[featuregate.Feature]featuregate.VersionedSpecs{
 		{
 			Default:    true,
 			PreRelease: featuregate.Beta,
+			Version:    version.MajorMinor(25, 8),
+		},
+	},
 	FabricManagerSupport: {
 		{
 			Default:    false,

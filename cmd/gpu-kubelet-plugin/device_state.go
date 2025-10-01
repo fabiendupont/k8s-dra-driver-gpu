@@ -514,9 +514,10 @@ func (s *DeviceState) applyMigDeviceConfig(ctx context.Context, config *configap
 func (s *DeviceState) applyFabricManagerConfig(ctx context.Context, config *configapi.FabricManagerConfig, claim *resourceapi.ResourceClaim, results []*resourceapi.DeviceRequestAllocationResult) (*DeviceConfigState, error) {
 	// Optimize GPU selection if fabric optimization is enabled
 	if s.shouldOptimizeGpuSelection(results) {
-		optimalGPUs, err := s.selectOptimalGpuCombination(len(results), &DefaultFabricOptimizationConfig)
+		// Use fallback mechanism for GPU selection
+		optimalGPUs, err := s.selectOptimalGpuCombinationWithFallback(len(results), &DefaultFabricOptimizationConfig, &DefaultFallbackConfig)
 		if err != nil {
-			klog.Warningf("Failed to select optimal GPU combination, using original allocation: %v", err)
+			klog.Warningf("Failed to select optimal GPU combination with fallback, using original allocation: %v", err)
 		} else {
 			// Update results with optimal GPUs
 			results = s.updateResultsWithOptimalGPUs(results, optimalGPUs)
@@ -1009,27 +1010,45 @@ func (s *DeviceState) isHopperArchitecture(gpu *GpuInfo) bool {
 // validateGpuForMigCreation validates a GPU for MIG device creation.
 func (s *DeviceState) validateGpuForMigCreation(gpu *GpuInfo) error {
 	if gpu == nil {
-		return fmt.Errorf("GPU cannot be nil")
+		return NewValidationError("GPU cannot be nil", "gpu", nil, []string{
+			"Ensure a valid GPU is provided",
+			"Check GPU allocation logic",
+		})
 	}
 
 	// Check if GPU is MIG-enabled
 	if !gpu.migEnabled {
-		return fmt.Errorf("GPU %s does not have MIG mode enabled", gpu.UUID)
+		return NewMIGNotEnabledError(gpu.UUID)
 	}
 
 	// Check if GPU has available MIG profiles
 	if len(gpu.migProfiles) == 0 {
-		return fmt.Errorf("GPU %s has no available MIG profiles", gpu.UUID)
+		return NewMIGError(
+			fmt.Sprintf("GPU %s has no available MIG profiles", gpu.UUID),
+			"profile_enumeration",
+			[]string{
+				"Check if MIG profiles are properly configured",
+				"Verify GPU supports the requested MIG profiles",
+				"Ensure GPU is not in exclusive mode",
+				"Try recreating MIG profiles",
+			},
+		)
 	}
 
 	// Validate GPU architecture compatibility
 	if err := s.validateGpuArchitectureForMig(gpu); err != nil {
-		return fmt.Errorf("GPU architecture validation failed: %w", err)
+		return WrapError(err, ErrorCategoryMIG, []string{
+			"Use a GPU with MIG support (Ampere, Hopper, Blackwell)",
+			"Check GPU architecture compatibility",
+		})
 	}
 
 	// Validate GPU memory requirements
 	if err := s.validateGpuMemoryForMig(gpu); err != nil {
-		return fmt.Errorf("GPU memory validation failed: %w", err)
+		return WrapError(err, ErrorCategoryMIG, []string{
+			"Use a GPU with sufficient memory",
+			"Check if other MIG instances are consuming memory",
+		})
 	}
 
 	return nil
@@ -1196,15 +1215,25 @@ func (s *DeviceState) validateResourceClaimForMig(claim *resourceapi.ResourceCla
 // selectMigProfile selects an appropriate MIG profile based on GPU capabilities and requirements.
 func (s *DeviceState) selectMigProfile(gpu *GpuInfo, config *configapi.MigDeviceConfig) string {
 	if len(gpu.migProfiles) == 0 {
+		klog.V(4).Infof("MIG profile selection: No profiles available for GPU %s (architecture: %s)", gpu.UUID, gpu.architecture)
 		return ""
 	}
+
+	klog.V(4).Infof("MIG profile selection: Evaluating %d profiles for GPU %s (architecture: %s, memory: %dGB)",
+		len(gpu.migProfiles), gpu.UUID, gpu.architecture, gpu.memoryBytes/(1024*1024*1024))
 
 	// Simple selection strategy: prefer smaller profiles for better resource utilization
 	var bestProfile *MigProfileInfo
 	var bestScore = -1
+	profileScores := make(map[string]int)
 
 	for _, profile := range gpu.migProfiles {
 		score := s.calculateProfileScore(profile, gpu, config)
+		profileScores[profile.String()] = score
+
+		klog.V(6).Infof("MIG profile evaluation: Profile %s scored %d (compute slices: %d, memory: %dGB, placements: %d)",
+			profile.String(), score, profile.profile.GetInfo().C, profile.profile.GetInfo().GB, len(profile.placements))
+
 		if score > bestScore {
 			bestScore = score
 			bestProfile = profile
@@ -1212,10 +1241,14 @@ func (s *DeviceState) selectMigProfile(gpu *GpuInfo, config *configapi.MigDevice
 	}
 
 	if bestProfile != nil {
+		klog.V(4).Infof("MIG profile selection: Selected profile %s with score %d for GPU %s",
+			bestProfile.String(), bestScore, gpu.UUID)
 		return bestProfile.String()
 	}
 
 	// Fallback to first available profile
+	klog.V(3).Infof("MIG profile selection: No profile scored > -1, falling back to first available profile %s for GPU %s",
+		gpu.migProfiles[0].String(), gpu.UUID)
 	return gpu.migProfiles[0].String()
 }
 
@@ -1232,6 +1265,8 @@ func (s *DeviceState) calculateProfileScore(profile *MigProfileInfo, gpu *GpuInf
 	if maxSlices > 0 {
 		sliceScore := maxSlices - profileInfo.C
 		score += sliceScore * 10 // Weight compute slices heavily
+		klog.V(7).Infof("MIG profile scoring: Profile %s slice score: %d (max: %d, profile: %d, weighted: %d)",
+			profile.String(), sliceScore, maxSlices, profileInfo.C, sliceScore*10)
 	}
 
 	// Prefer profiles with smaller memory footprint
@@ -1239,12 +1274,17 @@ func (s *DeviceState) calculateProfileScore(profile *MigProfileInfo, gpu *GpuInf
 	if gpu.memoryBytes > 0 {
 		memoryScore := int(gpu.memoryBytes/1024/1024/1024) - profileInfo.GB
 		score += memoryScore * 2 // Weight memory moderately
+		klog.V(7).Infof("MIG profile scoring: Profile %s memory score: %d (GPU: %dGB, profile: %dGB, weighted: %d)",
+			profile.String(), memoryScore, gpu.memoryBytes/(1024*1024*1024), profileInfo.GB, memoryScore*2)
 	}
 
 	// Prefer profiles with more placement options
 	placementScore := len(profile.placements)
 	score += placementScore * 5 // Weight placement options moderately
+	klog.V(7).Infof("MIG profile scoring: Profile %s placement score: %d (placements: %d, weighted: %d)",
+		profile.String(), placementScore, len(profile.placements), placementScore*5)
 
+	klog.V(7).Infof("MIG profile scoring: Profile %s total score: %d", profile.String(), score)
 	return score
 }
 
@@ -1262,24 +1302,35 @@ func (s *DeviceState) getMaxComputeSlices(gpu *GpuInfo) int {
 
 // createMigDevices creates MIG devices based on GPU capabilities and requirements.
 func (s *DeviceState) createMigDevices(gpu *GpuInfo, config *configapi.MigDeviceConfig, claim *resourceapi.ResourceClaim) ([]AllocatedMigDevice, error) {
+	klog.V(4).Infof("MIG device creation: Starting for GPU %s (architecture: %s, MIG enabled: %v)",
+		gpu.UUID, gpu.architecture, gpu.migEnabled)
+
 	// Comprehensive validation of input parameters
 	if err := s.validateResourceClaimForMig(claim); err != nil {
+		klog.Errorf("MIG device creation: Resource claim validation failed for GPU %s: %v", gpu.UUID, err)
 		return nil, fmt.Errorf("resource claim validation failed: %w", err)
 	}
 
 	if err := s.validateMigDeviceConfig(config); err != nil {
+		klog.Errorf("MIG device creation: MIG device config validation failed for GPU %s: %v", gpu.UUID, err)
 		return nil, fmt.Errorf("MIG device config validation failed: %w", err)
 	}
 
 	if err := s.validateGpuForMigCreation(gpu); err != nil {
+		klog.Errorf("MIG device creation: GPU validation failed for GPU %s: %v", gpu.UUID, err)
 		return nil, fmt.Errorf("GPU validation failed: %w", err)
 	}
+
+	klog.V(5).Infof("MIG device creation: All validations passed for GPU %s", gpu.UUID)
 
 	// Select optimal profile
 	profile := s.selectMigProfile(gpu, config)
 	if profile == "" {
+		klog.Errorf("MIG device creation: Failed to select MIG profile for GPU %s", gpu.UUID)
 		return nil, fmt.Errorf("failed to select MIG profile for GPU %s", gpu.UUID)
 	}
+
+	klog.V(4).Infof("MIG device creation: Selected profile %s for GPU %s", profile, gpu.UUID)
 
 	// Find the selected profile
 	var selectedProfile *MigProfileInfo
@@ -1290,11 +1341,13 @@ func (s *DeviceState) createMigDevices(gpu *GpuInfo, config *configapi.MigDevice
 		}
 	}
 	if selectedProfile == nil {
+		klog.Errorf("MIG device creation: Selected MIG profile %s not found on GPU %s", profile, gpu.UUID)
 		return nil, fmt.Errorf("selected MIG profile %s not found on GPU %s", profile, gpu.UUID)
 	}
 
 	// Validate the selected profile
 	if err := s.validateMigProfile(selectedProfile, gpu); err != nil {
+		klog.Errorf("MIG device creation: MIG profile validation failed for profile %s on GPU %s: %v", profile, gpu.UUID, err)
 		return nil, fmt.Errorf("MIG profile validation failed: %w", err)
 	}
 
@@ -1304,8 +1357,12 @@ func (s *DeviceState) createMigDevices(gpu *GpuInfo, config *configapi.MigDevice
 		Size:  1,
 	}
 	if err := s.validateMigPlacement(&placement, gpu); err != nil {
+		klog.Errorf("MIG device creation: MIG placement validation failed for GPU %s: %v", gpu.UUID, err)
 		return nil, fmt.Errorf("MIG placement validation failed: %w", err)
 	}
+
+	klog.V(5).Infof("MIG device creation: Creating MIG device with profile %s, placement start=%d, size=%d for GPU %s",
+		profile, placement.Start, placement.Size, gpu.UUID)
 
 	// Create MIG device with validated placement
 	migDevice := AllocatedMigDevice{
@@ -1322,9 +1379,11 @@ func (s *DeviceState) createMigDevices(gpu *GpuInfo, config *configapi.MigDevice
 
 	// Validate the created device
 	if err := s.validateAllocatedMigDevice(migDevice, 0); err != nil {
+		klog.Errorf("MIG device creation: Allocated MIG device validation failed for GPU %s: %v", gpu.UUID, err)
 		return nil, fmt.Errorf("allocated MIG device validation failed: %w", err)
 	}
 
+	klog.V(4).Infof("MIG device creation: Successfully created MIG device %s for GPU %s", profile, gpu.UUID)
 	return []AllocatedMigDevice{migDevice}, nil
 }
 

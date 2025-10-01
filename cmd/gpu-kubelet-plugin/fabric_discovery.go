@@ -18,6 +18,7 @@ package main
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/NVIDIA/go-nvml/pkg/nvml"
 	"k8s.io/klog/v2"
@@ -25,6 +26,11 @@ import (
 
 // discoverFabricTopology discovers the complete fabric topology of the system.
 func (s *DeviceState) discoverFabricTopology() (*FabricTopology, error) {
+	startTime := time.Now()
+	defer func() {
+		// Will record metrics at the end with actual results
+	}()
+
 	topology := &FabricTopology{
 		GPUs:         make(map[string]*FabricGPUInfo),
 		Cliques:      make(map[string]*CliqueInfo),
@@ -51,28 +57,36 @@ func (s *DeviceState) discoverFabricTopology() (*FabricTopology, error) {
 	}
 
 	if len(topology.GPUs) == 0 {
-		return nil, fmt.Errorf("no GPUs found for fabric topology discovery")
+		err := NewFabricTopologyDiscoveryError("no GPUs found")
+		GetFabricMetricsCollector().RecordTopologyDiscovery(time.Since(startTime), err)
+		return nil, err
 	}
 
 	// Build clique information
 	err := s.buildCliqueInfo(topology)
 	if err != nil {
+		GetFabricMetricsCollector().RecordTopologyDiscovery(time.Since(startTime), err)
 		return nil, fmt.Errorf("failed to build clique info: %w", err)
 	}
 
 	// Calculate connectivity matrix
 	err = s.calculateConnectivity(topology)
 	if err != nil {
+		GetFabricMetricsCollector().RecordTopologyDiscovery(time.Since(startTime), err)
 		return nil, fmt.Errorf("failed to calculate connectivity: %w", err)
 	}
 
 	// Find optimal paths between GPUs
 	err = s.findOptimalPaths(topology)
 	if err != nil {
+		GetFabricMetricsCollector().RecordTopologyDiscovery(time.Since(startTime), err)
 		return nil, fmt.Errorf("failed to find optimal paths: %w", err)
 	}
 
 	klog.V(4).Infof("Fabric topology discovery completed: %d GPUs, %d cliques", len(topology.GPUs), len(topology.Cliques))
+
+	// Record successful discovery metrics
+	GetFabricMetricsCollector().RecordTopologyDiscovery(time.Since(startTime), nil)
 	return topology, nil
 }
 

@@ -165,68 +165,8 @@ func (s *DeviceState) chooseBestCliqueByConnectivity(cliqueIDs []string, topolog
 	return bestCliqueID
 }
 
-// selectOptimalGpuCombination selects the optimal GPU combination for a given request.
-func (s *DeviceState) selectOptimalGpuCombination(requestedCount int, config *FabricOptimizationConfig) ([]string, error) {
-	topology, err := s.discoverFabricTopology()
-	if err != nil {
-		return nil, fmt.Errorf("failed to discover fabric topology: %w", err)
-	}
-
-	// Get all available GPUs
-	availableGPUs := make([]string, 0)
-	for uuid, gpuInfo := range topology.GPUs {
-		if s.isGpuAvailable(uuid) && s.isFabricManagerCapableFromFabricInfo(gpuInfo) {
-			availableGPUs = append(availableGPUs, uuid)
-		}
-	}
-
-	if len(availableGPUs) < requestedCount {
-		return nil, fmt.Errorf("insufficient GPUs available: need %d, have %d", requestedCount, len(availableGPUs))
-	}
-
-	klog.V(4).Infof("Selecting optimal GPU combination from %d available GPUs for %d requested", len(availableGPUs), requestedCount)
-
-	// Generate all possible combinations
-	combinations := s.generateGpuCombinations(availableGPUs, requestedCount)
-
-	if len(combinations) == 0 {
-		return nil, fmt.Errorf("no valid GPU combinations found")
-	}
-
-	// Score each combination
-	bestCombination := make([]string, 0)
-	bestScore := float64(-1)
-
-	for _, combination := range combinations {
-		score := s.scoreGpuCombination(combination, topology)
-
-		// Apply configuration thresholds
-		if config != nil {
-			if score.TotalBandwidth < config.MinBandwidthThreshold {
-				klog.V(6).Infof("Skipping combination %v: bandwidth %d < threshold %d",
-					combination, score.TotalBandwidth, config.MinBandwidthThreshold)
-				continue
-			}
-			if score.AverageLatency > config.MaxLatencyThreshold {
-				klog.V(6).Infof("Skipping combination %v: latency %d > threshold %d",
-					combination, score.AverageLatency, config.MaxLatencyThreshold)
-				continue
-			}
-		}
-
-		if score.Score > bestScore {
-			bestScore = score.Score
-			bestCombination = combination
-		}
-	}
-
-	if len(bestCombination) == 0 {
-		return nil, fmt.Errorf("no GPU combination meets the performance thresholds")
-	}
-
-	klog.V(4).Infof("Selected optimal GPU combination %v with score %.3f", bestCombination, bestScore)
-	return bestCombination, nil
-}
+// selectOptimalGpuCombination is unused - functionality moved to fabric_selection.go
+// This function has been replaced by selectOptimalGpuCombinationWithFallback in fabric_fallback.go
 
 // isGpuAvailable checks if a GPU is available for allocation.
 func (s *DeviceState) isGpuAvailable(uuid string) bool {

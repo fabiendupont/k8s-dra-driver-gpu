@@ -16,20 +16,39 @@
 
 package main
 
+import (
+	"time"
+
+	"k8s.io/klog/v2"
+)
+
 // scoreGpuCombination scores a GPU combination based on fabric performance.
 func (s *DeviceState) scoreGpuCombination(gpus []string, topology *FabricTopology) *FabricScore {
+	startTime := time.Now()
+	var score *FabricScore
+
+	defer func() {
+		duration := time.Since(startTime)
+		if score != nil {
+			GetFabricMetricsCollector().RecordGpuScoring(duration, score)
+		}
+	}()
+
 	if len(gpus) == 0 {
-		return &FabricScore{}
+		score = &FabricScore{}
+		return score
 	}
 
 	if len(gpus) == 1 {
 		// Single GPU - no fabric performance to measure
-		return &FabricScore{
+		score = &FabricScore{
 			TotalBandwidth:    0,
 			AverageLatency:    0,
 			DirectConnections: 0,
 			MaxHopCount:       0,
+			Score:             0.0, // Explicitly set score to 0 for single GPU
 		}
+		return score
 	}
 
 	totalBandwidth := int64(0)
@@ -68,7 +87,7 @@ func (s *DeviceState) scoreGpuCombination(gpus []string, topology *FabricTopolog
 		averageLatency = totalLatency / int64(pairs)
 	}
 
-	return &FabricScore{
+	score = &FabricScore{
 		TotalBandwidth:    totalBandwidth,
 		AverageLatency:    averageLatency,
 		DirectConnections: directConnections,
@@ -80,6 +99,8 @@ func (s *DeviceState) scoreGpuCombination(gpus []string, topology *FabricTopolog
 			MaxHopCount:       maxHopCount,
 		}, &DefaultScoringWeights),
 	}
+
+	return score
 }
 
 // generateGpuCombinations generates all possible combinations of GPUs.
@@ -90,6 +111,10 @@ func (s *DeviceState) generateGpuCombinations(gpus []string, count int) [][]stri
 
 	var combinations [][]string
 	s.generateCombinationsRecursive(gpus, count, 0, []string{}, &combinations)
+
+	// Record metrics for combination generation
+	GetFabricMetricsCollector().RecordGpuCombinationGeneration(len(combinations))
+
 	return combinations
 }
 
@@ -98,6 +123,18 @@ func (s *DeviceState) calculateCompositeScore(score *FabricScore, weights *Scori
 	if score == nil || weights == nil {
 		return 0.0
 	}
+
+	// Validate and normalize weights
+	normalizedWeights, err := NormalizeFabricOptimizationConfig(&FabricOptimizationConfig{
+		ScoringWeights: *weights,
+	})
+	if err != nil {
+		klog.Warningf("Failed to normalize scoring weights, using defaults: %v", err)
+		normalizedWeights = &DefaultFabricOptimizationConfig
+	}
+
+	// Use normalized weights
+	weights = &normalizedWeights.ScoringWeights
 
 	// Normalize scores (simplified normalization)
 	bandwidthScore := float64(score.TotalBandwidth) / 1000.0       // Normalize to 0-1 range
