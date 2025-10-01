@@ -223,8 +223,8 @@ func TestFabricManagerEndToEnd(t *testing.T) {
 				containerEdits, err := deviceState.generateFabricPartitionContainerEdits(preparedPartitions)
 				require.NoError(t, err)
 				require.NotNil(t, containerEdits)
-				assert.NotEmpty(t, containerEdits.ContainerEdits.Env)
-				assert.NotEmpty(t, containerEdits.ContainerEdits.DeviceNodes)
+				assert.NotEmpty(t, containerEdits.Env)
+				assert.NotEmpty(t, containerEdits.DeviceNodes)
 			}
 		})
 	}

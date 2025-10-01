@@ -288,10 +288,20 @@ func (s *DeviceState) prepareDevices(ctx context.Context, claim *resourceapi.Res
 		Requests: []string{},
 		Config:   configapi.DefaultMigDeviceConfig(),
 	})
-	configs = slices.Insert(configs, 0, &OpaqueDeviceConfig{
-		Requests: []string{},
-		Config:   configapi.DefaultFabricManagerConfig(),
-	})
+	// Check if we should auto-create FabricManager config for multi-GPU scenarios
+	autoFabricConfig, err := s.autoCreateFabricManagerConfig(claim.Status.Allocation.Devices.Results, claim)
+	if err != nil {
+		return nil, fmt.Errorf("failed to auto-create FabricManager config: %w", err)
+	}
+
+	// Add auto-created config if needed
+	if autoFabricConfig != nil {
+		configs = append(configs, &OpaqueDeviceConfig{
+			Requests: []string{},
+			Config:   autoFabricConfig,
+		})
+		klog.V(4).Infof("Auto-created FabricManager config for multi-GPU claim %s", claim.UID)
+	}
 
 	// Look through the configs and figure out which one will be applied to
 	// each device allocation result based on their order of precedence and type.
@@ -466,7 +476,7 @@ func (s *DeviceState) applyConfig(ctx context.Context, config configapi.Interfac
 	}
 }
 
-// applyMigDeviceConfig handles MIG device configuration and creation
+// applyMigDeviceConfig handles MIG device configuration and creation.
 func (s *DeviceState) applyMigDeviceConfig(ctx context.Context, config *configapi.MigDeviceConfig, claim *resourceapi.ResourceClaim, results []*resourceapi.DeviceRequestAllocationResult) (*DeviceConfigState, error) {
 	// For MIG device configs, we need to create MIG devices from the allocated GPUs
 	var allocatedMigDevices AllocatedMigDevices
@@ -500,8 +510,20 @@ func (s *DeviceState) applyMigDeviceConfig(ctx context.Context, config *configap
 	return configState, nil
 }
 
-// applyFabricManagerConfig handles FabricManager device configuration and creation
+// applyFabricManagerConfig handles FabricManager device configuration and creation.
 func (s *DeviceState) applyFabricManagerConfig(ctx context.Context, config *configapi.FabricManagerConfig, claim *resourceapi.ResourceClaim, results []*resourceapi.DeviceRequestAllocationResult) (*DeviceConfigState, error) {
+	// Optimize GPU selection if fabric optimization is enabled
+	if s.shouldOptimizeGpuSelection(results) {
+		optimalGPUs, err := s.selectOptimalGpuCombination(len(results), &DefaultFabricOptimizationConfig)
+		if err != nil {
+			klog.Warningf("Failed to select optimal GPU combination, using original allocation: %v", err)
+		} else {
+			// Update results with optimal GPUs
+			results = s.updateResultsWithOptimalGPUs(results, optimalGPUs)
+			klog.V(4).Infof("Optimized GPU selection for FabricManager: %v", optimalGPUs)
+		}
+	}
+
 	// For FabricManager device configs, we need to create fabric partitions from the allocated GPUs
 	var allocatedFabricPartitions []AllocatedFabricPartition
 
@@ -541,7 +563,7 @@ func (s *DeviceState) applyFabricManagerConfig(ctx context.Context, config *conf
 	return configState, nil
 }
 
-// generateFabricPartitionContainerEdits generates container edits for fabric partitions
+// generateFabricPartitionContainerEdits generates container edits for fabric partitions.
 func (s *DeviceState) generateFabricPartitionContainerEdits(partitions *PreparedFabricPartitions) (*cdiapi.ContainerEdits, error) {
 	if partitions == nil || len(partitions.Partitions) == 0 {
 		return nil, nil
@@ -713,7 +735,7 @@ type PreparedMigDevices struct {
 	Devices []*MigDeviceInfo `json:"devices"`
 }
 
-// prepareMigDevices prepares MIG devices for use by containers
+// prepareMigDevices prepares MIG devices for use by containers.
 func (s *DeviceState) prepareMigDevices(claimUID string, allocated *AllocatedMigDevices) (*PreparedMigDevices, error) {
 	// Validate input parameters
 	if claimUID == "" {
@@ -797,7 +819,7 @@ func (s *DeviceState) prepareMigDevices(claimUID string, allocated *AllocatedMig
 	return prepared, nil
 }
 
-// unprepareMigDevices cleans up MIG devices after container use
+// unprepareMigDevices cleans up MIG devices after container use.
 func (s *DeviceState) unprepareMigDevices(claimUID string, devices *PreparedMigDevices) error {
 	if devices == nil {
 		return nil
@@ -813,7 +835,7 @@ func (s *DeviceState) unprepareMigDevices(claimUID string, devices *PreparedMigD
 	return nil
 }
 
-// validateAllocatedMigDevice validates a single allocated MIG device
+// validateAllocatedMigDevice validates a single allocated MIG device.
 func (s *DeviceState) validateAllocatedMigDevice(device AllocatedMigDevice, index int) error {
 	if device.ParentUUID == "" {
 		return fmt.Errorf("parent UUID cannot be empty")
@@ -834,7 +856,7 @@ func (s *DeviceState) validateAllocatedMigDevice(device AllocatedMigDevice, inde
 	return nil
 }
 
-// validateMigDeviceConfig validates the MIG device configuration
+// validateMigDeviceConfig validates the MIG device configuration.
 func (s *DeviceState) validateMigDeviceConfig(config *configapi.MigDeviceConfig) error {
 	if config == nil {
 		return fmt.Errorf("MIG device config cannot be nil")
@@ -855,7 +877,7 @@ func (s *DeviceState) validateMigDeviceConfig(config *configapi.MigDeviceConfig)
 	return nil
 }
 
-// validateMigDeviceSharing validates the MIG device sharing configuration
+// validateMigDeviceSharing validates the MIG device sharing configuration.
 func (s *DeviceState) validateMigDeviceSharing(sharing *configapi.MigDeviceSharing) error {
 	if sharing == nil {
 		return nil
@@ -879,7 +901,7 @@ func (s *DeviceState) validateMigDeviceSharing(sharing *configapi.MigDeviceShari
 	return nil
 }
 
-// validateMpsConfig validates the MPS configuration
+// validateMpsConfig validates the MPS configuration.
 func (s *DeviceState) validateMpsConfig(config *configapi.MpsConfig) error {
 	if config == nil {
 		return nil
@@ -912,7 +934,7 @@ func (s *DeviceState) validateMpsConfig(config *configapi.MpsConfig) error {
 
 // FabricManager-related validation functions
 
-// validateGpuForFabricManagerCreation validates a GPU for FabricManager device creation
+// validateGpuForFabricManagerCreation validates a GPU for FabricManager device creation.
 func (s *DeviceState) validateGpuForFabricManagerCreation(gpu *GpuInfo) error {
 	if gpu == nil {
 		return fmt.Errorf("GPU cannot be nil")
@@ -938,7 +960,7 @@ func (s *DeviceState) validateGpuForFabricManagerCreation(gpu *GpuInfo) error {
 	return nil
 }
 
-// isFabricManagerCapable checks if a GPU supports FabricManager
+// isFabricManagerCapable checks if a GPU supports FabricManager.
 func (s *DeviceState) isFabricManagerCapable(gpu *GpuInfo) bool {
 	// Check if architecture supports FabricManager
 	supportedArchitectures := []string{"Ampere", "Hopper", "Blackwell"}
@@ -950,7 +972,7 @@ func (s *DeviceState) isFabricManagerCapable(gpu *GpuInfo) bool {
 	return false
 }
 
-// isFabricAttached checks if a GPU is fabric-attached
+// isFabricAttached checks if a GPU is fabric-attached.
 func (s *DeviceState) isFabricAttached(gpu *GpuInfo) bool {
 	deviceHandle, ret := s.nvdevlib.nvmllib.DeviceGetHandleByUUID(gpu.UUID)
 	if ret != nvml.SUCCESS {
@@ -974,7 +996,7 @@ func (s *DeviceState) isFabricAttached(gpu *GpuInfo) bool {
 	return fabricAttached
 }
 
-// isAmpereArchitecture checks if a GPU is Ampere architecture
+// isAmpereArchitecture checks if a GPU is Ampere architecture.
 func (s *DeviceState) isAmpereArchitecture(gpu *GpuInfo) bool {
 	return gpu.architecture == "Ampere"
 }
@@ -984,7 +1006,7 @@ func (s *DeviceState) isHopperArchitecture(gpu *GpuInfo) bool {
 	return gpu.architecture == "Hopper" || gpu.architecture == "Blackwell"
 }
 
-// validateGpuForMigCreation validates a GPU for MIG device creation
+// validateGpuForMigCreation validates a GPU for MIG device creation.
 func (s *DeviceState) validateGpuForMigCreation(gpu *GpuInfo) error {
 	if gpu == nil {
 		return fmt.Errorf("GPU cannot be nil")
@@ -1013,7 +1035,7 @@ func (s *DeviceState) validateGpuForMigCreation(gpu *GpuInfo) error {
 	return nil
 }
 
-// validateGpuArchitectureForMig validates GPU architecture for MIG compatibility
+// validateGpuArchitectureForMig validates GPU architecture for MIG compatibility.
 func (s *DeviceState) validateGpuArchitectureForMig(gpu *GpuInfo) error {
 	if gpu.architecture == "" {
 		return fmt.Errorf("GPU architecture is not specified")
@@ -1036,7 +1058,7 @@ func (s *DeviceState) validateGpuArchitectureForMig(gpu *GpuInfo) error {
 	return nil
 }
 
-// validateGpuMemoryForMig validates GPU memory requirements for MIG
+// validateGpuMemoryForMig validates GPU memory requirements for MIG.
 func (s *DeviceState) validateGpuMemoryForMig(gpu *GpuInfo) error {
 	if gpu.memoryBytes == 0 {
 		return fmt.Errorf("GPU memory size is not specified")
@@ -1052,7 +1074,7 @@ func (s *DeviceState) validateGpuMemoryForMig(gpu *GpuInfo) error {
 	return nil
 }
 
-// getMinMemoryForMig returns the minimum memory required for MIG on a given architecture
+// getMinMemoryForMig returns the minimum memory required for MIG on a given architecture.
 func (s *DeviceState) getMinMemoryForMig(architecture string) uint64 {
 	switch architecture {
 	case "Ampere":
@@ -1064,7 +1086,7 @@ func (s *DeviceState) getMinMemoryForMig(architecture string) uint64 {
 	}
 }
 
-// validateMigProfile validates a MIG profile for a specific GPU
+// validateMigProfile validates a MIG profile for a specific GPU.
 func (s *DeviceState) validateMigProfile(profile *MigProfileInfo, gpu *GpuInfo) error {
 	if profile == nil {
 		return fmt.Errorf("MIG profile cannot be nil")
@@ -1101,7 +1123,7 @@ func (s *DeviceState) validateMigProfile(profile *MigProfileInfo, gpu *GpuInfo) 
 	return nil
 }
 
-// validateProfileMemoryRequirements validates memory requirements for a MIG profile
+// validateProfileMemoryRequirements validates memory requirements for a MIG profile.
 func (s *DeviceState) validateProfileMemoryRequirements(profile *MigProfileInfo, gpu *GpuInfo) error {
 	profileInfo := profile.profile.GetInfo()
 
@@ -1121,7 +1143,7 @@ func (s *DeviceState) validateProfileMemoryRequirements(profile *MigProfileInfo,
 	return nil
 }
 
-// validateMigPlacement validates MIG device placement
+// validateMigPlacement validates MIG device placement.
 func (s *DeviceState) validateMigPlacement(placement *nvml.GpuInstancePlacement, gpu *GpuInfo) error {
 	if placement == nil {
 		return fmt.Errorf("placement cannot be nil")
@@ -1147,7 +1169,7 @@ func (s *DeviceState) validateMigPlacement(placement *nvml.GpuInstancePlacement,
 	return nil
 }
 
-// validateResourceClaimForMig validates a resource claim for MIG device allocation
+// validateResourceClaimForMig validates a resource claim for MIG device allocation.
 func (s *DeviceState) validateResourceClaimForMig(claim *resourceapi.ResourceClaim) error {
 	if claim == nil {
 		return fmt.Errorf("resource claim cannot be nil")
@@ -1171,7 +1193,7 @@ func (s *DeviceState) validateResourceClaimForMig(claim *resourceapi.ResourceCla
 	return nil
 }
 
-// selectMigProfile selects an appropriate MIG profile based on GPU capabilities and requirements
+// selectMigProfile selects an appropriate MIG profile based on GPU capabilities and requirements.
 func (s *DeviceState) selectMigProfile(gpu *GpuInfo, config *configapi.MigDeviceConfig) string {
 	if len(gpu.migProfiles) == 0 {
 		return ""
@@ -1179,7 +1201,7 @@ func (s *DeviceState) selectMigProfile(gpu *GpuInfo, config *configapi.MigDevice
 
 	// Simple selection strategy: prefer smaller profiles for better resource utilization
 	var bestProfile *MigProfileInfo
-	var bestScore int = -1
+	var bestScore = -1
 
 	for _, profile := range gpu.migProfiles {
 		score := s.calculateProfileScore(profile, gpu, config)
@@ -1197,7 +1219,7 @@ func (s *DeviceState) selectMigProfile(gpu *GpuInfo, config *configapi.MigDevice
 	return gpu.migProfiles[0].String()
 }
 
-// calculateProfileScore calculates a score for a MIG profile based on various factors
+// calculateProfileScore calculates a score for a MIG profile based on various factors.
 func (s *DeviceState) calculateProfileScore(profile *MigProfileInfo, gpu *GpuInfo, config *configapi.MigDeviceConfig) int {
 	score := 0
 
@@ -1226,7 +1248,7 @@ func (s *DeviceState) calculateProfileScore(profile *MigProfileInfo, gpu *GpuInf
 	return score
 }
 
-// getMaxComputeSlices returns the maximum number of compute slices for the GPU architecture
+// getMaxComputeSlices returns the maximum number of compute slices for the GPU architecture.
 func (s *DeviceState) getMaxComputeSlices(gpu *GpuInfo) int {
 	switch gpu.architecture {
 	case "Hopper", "Blackwell":
@@ -1238,7 +1260,7 @@ func (s *DeviceState) getMaxComputeSlices(gpu *GpuInfo) int {
 	}
 }
 
-// createMigDevices creates MIG devices based on GPU capabilities and requirements
+// createMigDevices creates MIG devices based on GPU capabilities and requirements.
 func (s *DeviceState) createMigDevices(gpu *GpuInfo, config *configapi.MigDeviceConfig, claim *resourceapi.ResourceClaim) ([]AllocatedMigDevice, error) {
 	// Comprehensive validation of input parameters
 	if err := s.validateResourceClaimForMig(claim); err != nil {
@@ -1308,7 +1330,7 @@ func (s *DeviceState) createMigDevices(gpu *GpuInfo, config *configapi.MigDevice
 
 // FabricManager device creation functions
 
-// createFabricManagerDevices creates fabric partitions based on GPU capabilities and requirements
+// createFabricManagerDevices creates fabric partitions based on GPU capabilities and requirements.
 func (s *DeviceState) createFabricManagerDevices(gpu *GpuInfo, config *configapi.FabricManagerConfig, claim *resourceapi.ResourceClaim) ([]AllocatedFabricPartition, error) {
 	// Validate input parameters
 	if err := s.validateResourceClaimForFabricManager(claim); err != nil {
@@ -1346,7 +1368,7 @@ func (s *DeviceState) createFabricManagerDevices(gpu *GpuInfo, config *configapi
 	return []AllocatedFabricPartition{fabricPartition}, nil
 }
 
-// prepareFabricPartitions prepares fabric partitions for use by containers
+// prepareFabricPartitions prepares fabric partitions for use by containers.
 func (s *DeviceState) prepareFabricPartitions(claimUID string, allocated []AllocatedFabricPartition) (*PreparedFabricPartitions, error) {
 	// Validate input parameters
 	if claimUID == "" {
@@ -1388,7 +1410,7 @@ func (s *DeviceState) prepareFabricPartitions(claimUID string, allocated []Alloc
 	return prepared, nil
 }
 
-// unprepareFabricPartitions cleans up fabric partitions after container use
+// unprepareFabricPartitions cleans up fabric partitions after container use.
 func (s *DeviceState) unprepareFabricPartitions(claimUID string, partitions *PreparedFabricPartitions) error {
 	if partitions == nil {
 		return nil
@@ -1407,7 +1429,7 @@ func (s *DeviceState) unprepareFabricPartitions(claimUID string, partitions *Pre
 	return nil
 }
 
-// validateAllocatedFabricPartition validates a single allocated fabric partition
+// validateAllocatedFabricPartition validates a single allocated fabric partition.
 func (s *DeviceState) validateAllocatedFabricPartition(partition AllocatedFabricPartition, index int) error {
 	if partition.ParentUUID == "" {
 		return fmt.Errorf("parent UUID cannot be empty")
@@ -1424,7 +1446,7 @@ func (s *DeviceState) validateAllocatedFabricPartition(partition AllocatedFabric
 	return nil
 }
 
-// validateFabricManagerConfig validates the FabricManager configuration
+// validateFabricManagerConfig validates the FabricManager configuration.
 func (s *DeviceState) validateFabricManagerConfig(config *configapi.FabricManagerConfig) error {
 	if config == nil {
 		return fmt.Errorf("FabricManager config cannot be nil")
@@ -1440,7 +1462,7 @@ func (s *DeviceState) validateFabricManagerConfig(config *configapi.FabricManage
 	return nil
 }
 
-// validateResourceClaimForFabricManager validates a resource claim for FabricManager allocation
+// validateResourceClaimForFabricManager validates a resource claim for FabricManager allocation.
 func (s *DeviceState) validateResourceClaimForFabricManager(claim *resourceapi.ResourceClaim) error {
 	if claim == nil {
 		return fmt.Errorf("resource claim cannot be nil")
@@ -1461,7 +1483,7 @@ func (s *DeviceState) validateResourceClaimForFabricManager(claim *resourceapi.R
 	return nil
 }
 
-// getCliqueID gets the clique ID for a GPU
+// getCliqueID gets the clique ID for a GPU.
 func (s *DeviceState) getCliqueID(gpu *GpuInfo) string {
 	deviceHandle, ret := s.nvdevlib.nvmllib.DeviceGetHandleByUUID(gpu.UUID)
 	if ret != nvml.SUCCESS {

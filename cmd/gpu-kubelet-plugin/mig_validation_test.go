@@ -63,10 +63,10 @@ func TestValidateGpuArchitectureForMig(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			gpu := &GpuInfo{architecture: tt.architecture}
-			
+
 			// Create a minimal DeviceState for testing
 			deviceState := &DeviceState{}
-			
+
 			err := deviceState.validateGpuArchitectureForMig(gpu)
 			if tt.wantErr {
 				require.Error(t, err)
@@ -127,10 +127,10 @@ func TestValidateGpuMemoryForMig(t *testing.T) {
 				architecture: tt.architecture,
 				memoryBytes:  tt.memoryBytes,
 			}
-			
+
 			// Create a minimal DeviceState for testing
 			deviceState := &DeviceState{}
-			
+
 			err := deviceState.validateGpuMemoryForMig(gpu)
 			if tt.wantErr {
 				require.Error(t, err)
@@ -188,10 +188,10 @@ func TestValidateMigPlacement(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			gpu := &GpuInfo{architecture: tt.architecture}
-			
+
 			// Create a minimal DeviceState for testing
 			deviceState := &DeviceState{}
-			
+
 			err := deviceState.validateMigPlacement(tt.placement, gpu)
 			if tt.wantErr {
 				require.Error(t, err)
@@ -286,7 +286,7 @@ func TestValidateAllocatedMigDevice(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Create a minimal DeviceState for testing
 			deviceState := &DeviceState{}
-			
+
 			err := deviceState.validateAllocatedMigDevice(tt.device, tt.index)
 			if tt.wantErr {
 				require.Error(t, err)
@@ -330,7 +330,7 @@ func TestGetMinMemoryForMig(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			// Create a minimal DeviceState for testing
 			deviceState := &DeviceState{}
-			
+
 			result := deviceState.getMinMemoryForMig(tt.architecture)
 			assert.Equal(t, tt.expected, result)
 		})
@@ -368,10 +368,10 @@ func TestGetMaxComputeSlices(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			gpu := &GpuInfo{architecture: tt.architecture}
-			
+
 			// Create a minimal DeviceState for testing
 			deviceState := &DeviceState{}
-			
+
 			result := deviceState.getMaxComputeSlices(gpu)
 			assert.Equal(t, tt.expected, result)
 		})

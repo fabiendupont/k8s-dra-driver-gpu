@@ -448,7 +448,7 @@ func (l deviceLib) setComputeMode(uuids []string, mode string) error {
 	return nil
 }
 
-// TODO: Reenable dynamic MIG functionality once it is supported in Kubernetes 1.32
+// Dynamic MIG functionality is supported in Kubernetes 1.32+.
 func (l *deviceLib) createMigDevice(gpu *GpuInfo, profile nvml.GpuInstanceProfileInfo, placement *nvml.GpuInstancePlacement) (*MigDeviceInfo, error) {
 	if err := l.Init(); err != nil {
 		return nil, err
@@ -506,7 +506,7 @@ func (l *deviceLib) deleteMigDevice(mig *MigDeviceInfo) error {
 
 // FabricManager partition management functions
 
-// createFabricPartition creates a fabric partition on a GPU
+// createFabricPartition creates a fabric partition on a GPU.
 func (l *deviceLib) createFabricPartition(gpu *GpuInfo, partitionName string, cliqueID string) (*FabricPartitionInfo, error) {
 	if err := l.Init(); err != nil {
 		return nil, err
@@ -542,7 +542,7 @@ func (l *deviceLib) createFabricPartition(gpu *GpuInfo, partitionName string, cl
 	return fabricPartition, nil
 }
 
-// deleteFabricPartition removes a fabric partition from a GPU
+// deleteFabricPartition removes a fabric partition from a GPU.
 func (l *deviceLib) deleteFabricPartition(partition *FabricPartitionInfo) error {
 	if err := l.Init(); err != nil {
 		return err
@@ -553,37 +553,4 @@ func (l *deviceLib) deleteFabricPartition(partition *FabricPartitionInfo) error 
 	// In a full implementation, this would interact with FabricManager APIs
 	klog.Infof("Deleted fabric partition %s from GPU %s", partition.PartitionName, partition.ParentUUID)
 	return nil
-}
-
-// getFabricPartitionInfo retrieves information about a fabric partition
-func (l *deviceLib) getFabricPartitionInfo(gpu *GpuInfo) (*FabricPartitionInfo, error) {
-	if err := l.Init(); err != nil {
-		return nil, err
-	}
-	defer l.alwaysShutdown()
-
-	deviceHandle, ret := l.nvmllib.DeviceGetHandleByUUID(gpu.UUID)
-	if ret != nvml.SUCCESS {
-		return nil, fmt.Errorf("error getting GPU device handle: %v", ret)
-	}
-
-	// Get fabric info
-	fabricInfo, ret := deviceHandle.GetGpuFabricInfo()
-	if ret != nvml.SUCCESS {
-		return nil, fmt.Errorf("error getting GPU fabric info: %v", ret)
-	}
-
-	if fabricInfo.State != nvml.GPU_FABRIC_STATE_COMPLETED {
-		return nil, fmt.Errorf("GPU fabric is not in completed state: %v", fabricInfo.State)
-	}
-
-	partitionInfo := &FabricPartitionInfo{
-		PartitionID:   int(fabricInfo.CliqueId),
-		PartitionName: fmt.Sprintf("fabric-partition-%d", fabricInfo.CliqueId),
-		ParentUUID:    gpu.UUID,
-		CliqueID:      fmt.Sprintf("%d", fabricInfo.CliqueId),
-		State:         "active",
-	}
-
-	return partitionInfo, nil
 }

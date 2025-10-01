@@ -39,6 +39,12 @@ const (
 
 	// FabricManagerSupport allows FabricManager settings and fabric partition management.
 	FabricManagerSupport featuregate.Feature = "FabricManagerSupport"
+
+	// FabricAwareOptimization enables fabric-aware GPU selection and optimization.
+	FabricAwareOptimization featuregate.Feature = "FabricAwareOptimization"
+
+	// AutoFabricManagerDetection enables automatic FabricManager detection for multi-GPU scenarios.
+	AutoFabricManagerDetection featuregate.Feature = "AutoFabricManagerDetection"
 )
 
 // FeatureGates is a singleton representing the set of all feature gates and their values.
@@ -67,6 +73,20 @@ var defaultFeatureGates = map[featuregate.Feature]featuregate.VersionedSpecs{
 			Default:    true,
 			PreRelease: featuregate.Beta,
 	FabricManagerSupport: {
+		{
+			Default:    false,
+			PreRelease: featuregate.Alpha,
+			Version:    version.MajorMinor(25, 8),
+		},
+	},
+	FabricAwareOptimization: {
+		{
+			Default:    false,
+			PreRelease: featuregate.Alpha,
+			Version:    version.MajorMinor(25, 8),
+		},
+	},
+	AutoFabricManagerDetection: {
 		{
 			Default:    false,
 			PreRelease: featuregate.Alpha,

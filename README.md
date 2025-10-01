@@ -38,6 +38,18 @@ To learn about what we're planning to build, please have a look at [these](https
 While some GPU allocation features can be tried out, they are not yet officially supported.
 Hence, the GPU kubelet plugin is currently disabled by default in the Helm chart installation.
 
+#### Fabric-Aware GPU Optimization
+
+The driver now includes intelligent fabric-aware GPU selection and optimization features:
+
+- **Automatic Multi-GPU Optimization**: When multiple GPUs are requested, the system automatically selects optimal GPU combinations based on NVLink fabric topology
+- **Smart FabricManager Detection**: Automatically detects when FabricManager would be beneficial for multi-GPU workloads and creates appropriate configurations
+- **Fabric-Aware Scoring**: Considers bandwidth, latency, direct connections, and hop count when selecting GPU combinations
+- **Feature Gate Control**: All optimization features can be enabled/disabled via feature gates:
+  - `FabricAwareOptimization`: Enables fabric-aware GPU selection
+  - `AutoFabricManagerDetection`: Enables automatic FabricManager detection
+  - `FabricManagerSupport`: Enables FabricManager functionality
+
 For exploration and demonstration purposes, see the "demo" section below, and also browse the `demo/specs/quickstart` directory in this repository.
 
 ## Installation
